@@ -10,7 +10,7 @@ open System.IO
 
 type ArgsCommand = Import | Export | Root
 
-type ArgsStoreType = Store | Folder
+type ArgsStoreType = Store | Folder | Azure
   
 type Args =
     {
@@ -116,6 +116,7 @@ module Args =
         
         | "-o" :: "store" :: outpath :: xs  ->  parse' { a with outPath = Some outpath; outType = Some Store } xs
         | "-o" :: "folder" :: outpath :: xs ->  parse' { a with outPath = Some outpath; outType = Some Folder } xs
+        | "-o" :: "azure" :: outpath :: xs  ->  parse' { a with outPath = Some outpath; outType = Some Azure } xs
         | "-o" :: outpath :: xs             ->  parse' { a with outPath = Some outpath; outType = Some Store } xs
         | "-o" :: []                        ->  failwith "missing argument: -o <outpath>"
         | "-okey" :: key :: xs              ->  parse' { a with outKey = Some key } xs

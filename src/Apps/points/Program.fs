@@ -107,34 +107,46 @@ let export args =
         | Some p -> p
         | None -> failwith "missing output (-o)"
 
-    let outStore = 
-        match args.outType with
-        | Some Store  -> (new SimpleDiskStore(outPath)).ToPointCloudStore()
-        | Some Folder -> (new SimpleFolderStore(outPath)).ToPointCloudStore()
-        | _           -> failwith "missing output storage (-o)"
-
-    let key =
-        match args.inKey, args.outKey with 
-        | Some k, None -> k 
-        | None, _ -> failwith "missing input point cloud key (-ikey)"
-        | _, Some _ -> failwith "must not define output key for export (-okey)" 
-
+    
     let gzipped = match args.gzipped with | Some x -> x | None -> false
 
-    Report.BeginTimed("exporting")
-    match args.inlining with
-    | Some true -> inStore.InlinePointSet(key, outStore, gzipped)
-    | _         -> if gzipped then printfn "[WARNING] -z is only supported with -inline"
-                   inStore.ExportPointSet(key, outStore, args.verbose)
-    outStore.Flush()
-    Report.EndTimed() |> ignore
+    match args.outType with
+    | Some Azure ->
+        let key =
+            match args.inKey with
+            | Some k -> k
+            | None -> failwith "missing input point cloud key (-ikey)"
 
-    match args.metadataKey with
-    | Some k -> let pc = inStore.GetPointSet(key)
-                let meta = createMetaData pc false
-                outStore.Add(k, meta)
-                outStore.Flush()
-    | None   -> ()
+        let node = inStore.GetPointSet(key)
+        Aardworx.Test.createProject "076d30bdb65981b80549128670ce5b5b22a1ffd65e10361a18cd43b191bd732b" outPath node.Root.Value |> Async.RunSynchronously
+        ()
+    | _ -> 
+        let key =
+            match args.inKey, args.outKey with 
+            | Some k, None -> k 
+            | None, _ -> failwith "missing input point cloud key (-ikey)"
+            | _, Some _ -> failwith "must not define output key for export (-okey)" 
+
+        let outStore = 
+            match args.outType with
+            | Some Store  -> (new SimpleDiskStore(outPath)).ToPointCloudStore()
+            | Some Folder -> (new SimpleFolderStore(outPath)).ToPointCloudStore()
+            | _           -> failwith "missing output storage (-o)"
+
+        Report.BeginTimed("exporting")
+        match args.inlining with
+        | Some true -> inStore.InlinePointSet(key, outStore, gzipped)
+        | _         -> if gzipped then printfn "[WARNING] -z is only supported with -inline"
+                       inStore.ExportPointSet(key, outStore, args.verbose)
+        outStore.Flush()
+        Report.EndTimed() |> ignore
+
+        match args.metadataKey with
+        | Some k -> let pc = inStore.GetPointSet(key)
+                    let meta = createMetaData pc false
+                    outStore.Add(k, meta)
+                    outStore.Flush()
+        | None   -> ()
 
 let root args =
     

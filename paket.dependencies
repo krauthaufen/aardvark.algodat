@@ -32,6 +32,8 @@ nuget FShade ~> 4.3.8
 nuget Unofficial.DotSpatial.Projections ~> 0.0.4
 
 nuget Microsoft.NET.Test.Sdk            ~> 16.1.1
+nuget DotNetAuth 
+
 
 group Build
 framework: net471
