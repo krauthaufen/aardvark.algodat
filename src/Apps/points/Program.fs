@@ -91,34 +91,54 @@ let import (args : Args) =
 
 let export args =
     
-    let inPath =
-        match args.inPath with
-        | Some p -> p
-        | None -> failwith "missing input (-i)"
+    //let inPath =
+    //    match args.inPath with
+    //    | Some p -> p
+    //    | None -> failwith "missing input (-i)"
 
-    let inStore = 
-        match args.inType with
-        | Some Store  -> (new SimpleDiskStore(inPath)).ToPointCloudStore()
-        | Some Folder -> (new SimpleFolderStore(inPath)).ToPointCloudStore()
-        | _           -> failwith "missing input storage (-i)"
+    //let inStore = 
+    //    match args.inType with
+    //    | Some Store  -> (new SimpleDiskStore(inPath)).ToPointCloudStore()
+    //    | Some Folder -> (new SimpleFolderStore(inPath)).ToPointCloudStore()
+    //    | _           -> failwith "missing input storage (-i)"
 
-    let outPath =
-        match args.outPath with
-        | Some p -> p
-        | None -> failwith "missing output (-o)"
+    //let outPath =
+    //    match args.outPath with
+    //    | Some p -> p
+    //    | None -> failwith "missing output (-o)"
 
     
-    let gzipped = match args.gzipped with | Some x -> x | None -> false
+    //let gzipped = match args.gzipped with | Some x -> x | None -> false
 
-    match args.outType with
+    let inPath = @"C:\Users\Schorsch\Desktop\demo_intergeo_store"
+    let inStore = (new SimpleDiskStore(inPath)).ToPointCloudStore()
+    let outPath = "intergeo"
+
+
+    let inKeys =
+        let trafo0 = 
+            let m = M44d(0.958058901193302, -0.286571355589288, 0.0, -7311.5304327031, 0.286571355589288, 0.958058901193302, 0.0, 256905.212901514, 0.0, 0.0, 1.0, 706.748557267515, 0.0, 0.0, 0.0, 1.0)
+            Trafo3d(m, m.Inverse)
+        [
+            "287188cf-26fb-48da-99d0-7ade35ea81e4", trafo0
+            "f80989ea-7266-44d2-9b6c-0500c1da2d63", Trafo3d.Identity
+        ]
+
+    let gzipped = false
+
+    match Some Azure with
     | Some Azure ->
-        let key =
-            match args.inKey with
-            | Some k -> k
-            | None -> failwith "missing input point cloud key (-ikey)"
+        //let key =
+        //    match args.inKey with
+        //    | Some k -> k
+        //    | None -> failwith "missing input point cloud key (-ikey)"
 
-        let node = inStore.GetPointSet(key)
-        Aardworx.Test.createProject "076d30bdb65981b80549128670ce5b5b22a1ffd65e10361a18cd43b191bd732b" outPath node.Root.Value |> Async.RunSynchronously
+        let nodes = 
+            inKeys |> Seq.map (fun (k, t) ->
+                let n = inStore.GetPointCloudNode(k)
+                n, t
+            )
+        Aardworx.Test.createProject "a85d4bbe6564d33b51caa000266771e0e918bdbf81d7bd164b2bb4f58d62b778" outPath nodes |> Async.RunSynchronously
         ()
     | _ -> 
         let key =

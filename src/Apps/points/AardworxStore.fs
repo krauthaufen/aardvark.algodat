@@ -238,16 +238,12 @@ module Test =
         for (k, v) in kv do o.[k] <- JToken.FromObject v
         box o
 
-
-    let createProject (token : string) (name : string) (info : IPointCloudNode) =
+    let createProject (token : string) (name : string) (infos : seq<IPointCloudNode * Trafo3d>) =
         async {
             let projectPath = Path.Home + "pcv" + "projects" + name
 
-            let! blobPath = Authentication.createBlob token
-            let! sas = Authentication.getUploadSas token blobPath
 
-
-            let rec traverse (info : IPointCloudNode) =
+            let rec traverse (sas : Sas) (trafo : Trafo3d) (info : IPointCloudNode) =
                 async {
                     if not (isNull info) then
 
@@ -277,104 +273,144 @@ module Test =
                         if not (isNull info.Subnodes) then
                             for n in info.Subnodes do
                                 if not (isNull n) then
-                                    do! traverse n.Value
+                                    do! traverse sas trafo n.Value
 
                 }
 
+            let mutable pointSum = V3d.Zero
+            let mutable pointCount = 0L
+            let mutable bounds = Box3d.Invalid
+            let cloudRefs = System.Collections.Generic.List<obj>()
 
-            do! traverse info
+            let mutable i = 0
+            for (info, trafo) in infos do
+                let! blobPath = Authentication.createBlob token
+                let! sas = Authentication.getUploadSas token blobPath
 
-            let rootInfo =
-                let cell = info.Cell
-                let centroid = cell.GetCenter() + V3d info.CentroidLocal
-                createObj [
-                    "RootId", string info.Id :> obj
-                    "PointCount", info.PointCountTree |> float :> obj
-                    "Bounds", createObj [
-                        "Min", createObj [
-                            "X", info.BoundingBoxExactGlobal.Min.X :> obj
-                            "Y", info.BoundingBoxExactGlobal.Min.Y :> obj
-                            "Z", info.BoundingBoxExactGlobal.Min.Z :> obj
+                do! traverse sas trafo info
+
+                let rootInfo =
+                    let cell = info.Cell
+                    let centroid = cell.GetCenter() + V3d info.CentroidLocal
+                    createObj [
+                        "RootId", string info.Id :> obj
+                        "PointCount", info.PointCountTree |> float :> obj
+                        "Bounds", createObj [
+                            "Min", createObj [
+                                "X", info.BoundingBoxExactGlobal.Min.X :> obj
+                                "Y", info.BoundingBoxExactGlobal.Min.Y :> obj
+                                "Z", info.BoundingBoxExactGlobal.Min.Z :> obj
+                            ]
+                            "Max", createObj [
+                                "X", info.BoundingBoxExactGlobal.Max.X :> obj
+                                "Y", info.BoundingBoxExactGlobal.Max.Y :> obj
+                                "Z", info.BoundingBoxExactGlobal.Max.Z :> obj
+                            ]
                         ]
-                        "Max", createObj [
-                            "X", info.BoundingBoxExactGlobal.Max.X :> obj
-                            "Y", info.BoundingBoxExactGlobal.Max.Y :> obj
-                            "Z", info.BoundingBoxExactGlobal.Max.Z :> obj
+                        "Centroid", createObj [
+                            "X", centroid.X :> obj
+                            "Y", centroid.Y :> obj
+                            "Z", centroid.Z :> obj
                         ]
-                    ]
-                    "Centroid", createObj [
-                        "X", centroid.X :> obj
-                        "Y", centroid.Y :> obj
-                        "Z", centroid.Z :> obj
-                    ]
 
-                    "CentroidStdDev", info.CentroidLocalStdDev |> float :> obj
+                        "CentroidStdDev", info.CentroidLocalStdDev |> float :> obj
 
-                    "Cell", createObj [
-                        "X", float cell.X :> obj
-                        "Y", float cell.Y :> obj
-                        "Z", float cell.Z :> obj
-                        "E", cell.Exponent :> obj
+                        "Cell", createObj [
+                            "X", float cell.X :> obj
+                            "Y", float cell.Y :> obj
+                            "Z", float cell.Z :> obj
+                            "E", cell.Exponent :> obj
+                        ]
+
+                        "GZipped", false :> obj
                     ]
 
-                    "GZipped", false :> obj
-                ]
 
-            do! Blob.putString sas "root.json" (string rootInfo)
+                do! Blob.putString sas "root.json" (string rootInfo)
 
 
-            let! copyPath = FileSystem.copyBlob token blobPath (projectPath + "clouds" |> string)
-            let copyPath = Path.FromString copyPath
 
-            let cellCenter = info.Cell.GetCenter()
-            let bounds = info.BoundingBoxExactGlobal
-            let centroid = cellCenter + V3d info.CentroidLocal
-            let pointCount = info.PointCountTree
+
+                let! copyPath = FileSystem.copyBlob token blobPath (projectPath + "clouds" |> string)
+                let copyPath = Path.FromString copyPath
+
+                let cellCenter = info.Cell.GetCenter()
+                let bb = info.BoundingBoxExactGlobal
+                let centroid = cellCenter + V3d info.CentroidLocal
+                let cnt = info.PointCountTree
+
+                bounds.ExtendBy (bb.Transformed trafo)
+                pointSum <- pointSum + (trafo.Forward.TransformPos centroid) * float cnt
+                pointCount <- pointCount + cnt
+
+                cloudRefs.Add (
+                    createObj [
+                        "store",        box copyPath.name
+                        "key",          box (sprintf "cloud%d.pts" i)
+                        "name",         box (sprintf "cloud%d" i)
+                        "pointCount",   box (float cnt)
+                        "trafo",        box (trafo.Forward.ToArray())
+                        "bounds", createObj [
+                            "Min", createObj [
+                                "X", box bb.Min.X
+                                "Y", box bb.Min.Y
+                                "Z", box bb.Min.Z
+                            ]
+                            "Max", createObj [
+                                "X", box bb.Max.X
+                                "Y", box bb.Max.Y
+                                "Z", box bb.Max.Z
+                            ]
+                        ]
+                        "centroid", createObj [
+                            "X", box centroid.X
+                            "Y", box centroid.Y
+                            "Z", box centroid.Z
+                        ]
+
+                    ]
+                )
+
+                i <- i + 1
+
+
+
+            let centroid = pointSum / float pointCount
             let radius = 20.0
+
 
             let projectInfo =
                 createObj [
-                    "clouds", box [|
-                        createObj [
-                            "store",        box copyPath.name
-                            "key",          box "cloud.pts"
-                            "name",         box "cloud"
-                            "pointCount",   box (float pointCount)
-                            "bounds", createObj [
-                                "Min", createObj [
-                                    "X", box bounds.Min.X
-                                    "Y", box bounds.Min.Y
-                                    "Z", box bounds.Min.Z
-                                ]
-                                "Max", createObj [
-                                    "X", box bounds.Max.X
-                                    "Y", box bounds.Max.Y
-                                    "Z", box bounds.Max.Z
-                                ]
-                            ]
-                            "centroid", createObj [
-                                "X", box centroid.X
-                                "Y", box centroid.Y
-                                "Z", box centroid.Z
-                            ]
-
-                            
-                            "camera", createObj [
-                                "center", createObj [
-                                    "X", box centroid.X
-                                    "Y", box centroid.Y
-                                    "Z", box centroid.Z
-                                ]
-
-                                "radius", box radius
-                                "phi", box Constant.PiQuarter
-                                "theta", box Constant.PiQuarter
-                            ]
-
+                    "clouds", box (cloudRefs.ToArray())
+                    "pointCount",   box (float pointCount)
+                    "bounds", createObj [
+                        "Min", createObj [
+                            "X", box bounds.Min.X
+                            "Y", box bounds.Min.Y
+                            "Z", box bounds.Min.Z
                         ]
-                    |]
+                        "Max", createObj [
+                            "X", box bounds.Max.X
+                            "Y", box bounds.Max.Y
+                            "Z", box bounds.Max.Z
+                        ]
+                    ]
+                    "centroid", createObj [
+                        "X", box centroid.X
+                        "Y", box centroid.Y
+                        "Z", box centroid.Z
+                    ]
+                    "camera", createObj [
+                        "center", createObj [
+                            "X", box centroid.X
+                            "Y", box centroid.Y
+                            "Z", box centroid.Z
+                        ]
 
-                    "camera", createObj []
+                        "radius", box radius
+                        "phi", box Constant.PiQuarter
+                        "theta", box Constant.PiQuarter
+                    ]
 
                     "annotations", box [||]
                 ]
