@@ -309,14 +309,6 @@ namespace Aardvark.Geometry.Tests
             }
         }
 
-        [Test]
-        public void OverlappingBoundsThrowNotImplemented()
-        {
-            var a = QuadBox(Box3d.Unit);
-            var b = QuadBox(new Box3d(new V3d(0.5, 0.5, 0.5), new V3d(2, 2, 2)));
-            Assert.Throws<NotImplementedException>(() => Csg.Union(a, b));
-        }
-
         #endregion
 
         #region attributes

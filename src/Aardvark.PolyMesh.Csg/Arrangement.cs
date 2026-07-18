@@ -5,21 +5,37 @@ using Aardvark.Base;
 
 namespace Aardvark.Geometry
 {
+    internal static class CsgDictExtensions
+    {
+        public static TV GetOrCreate<TK, TV>(this Dictionary<TK, TV> dict, TK key, Func<TK, TV> create)
+            where TK : notnull
+        {
+            if (!dict.TryGetValue(key, out var v)) { v = create(key); dict[key] = v; }
+            return v;
+        }
+
+        public static TV? GetOrDefault<TK, TV>(this Dictionary<TK, TV> dict, TK key)
+            where TK : notnull where TV : class
+            => dict.TryGetValue(key, out var v) ? v : null;
+    }
+
     /// <summary>
     /// The arranged form of two input solids: both meshes ingested into the
-    /// kernel with all mutual intersections resolved and every fragment
-    /// classified against the other solid. The boolean operations are cheap
-    /// selections over this shared arrangement.
+    /// kernel, all mutual intersections resolved into fragments, and every
+    /// fragment labeled inside/outside the other solid. The boolean operations
+    /// are cheap selections over this shared arrangement.
     /// </summary>
     public sealed class CsgArrangement
     {
         private readonly Kernel m_kernel;
+        private readonly Pipeline m_pipeline;
         private readonly PolyMesh[] m_sources;
         private readonly CsgOptions m_options;
 
-        private CsgArrangement(Kernel kernel, PolyMesh[] sources, CsgOptions options)
+        private CsgArrangement(Kernel kernel, Pipeline pipeline, PolyMesh[] sources, CsgOptions options)
         {
             m_kernel = kernel;
+            m_pipeline = pipeline;
             m_sources = sources;
             m_options = options;
         }
@@ -27,68 +43,86 @@ namespace Aardvark.Geometry
         public static CsgArrangement Arrange(PolyMesh a, PolyMesh b, CsgOptions? options = null)
         {
             var o = options ?? CsgOptions.Default;
-            var kernel = new Kernel(new Eps(o.RelativeEpsilon));
             if (o.Verification == CsgVerification.None)
-                throw new NotSupportedException("input verification cannot be disabled in v0");
+                throw new NotSupportedException("verification cannot be disabled in v0");
+            var kernel = new Kernel(new Eps(o.RelativeEpsilon));
             kernel.Ingest(a, 0);
             kernel.Ingest(b, 1);
-
-            // M0: only the disjoint case is arranged; the intersecting pipeline is M2
-            var boxA = kernel.Bounds[0];
-            var boxB = kernel.Bounds[1];
-            var tol = kernel.Eps.Relative * Fun.Max(
-                boxA.Min.NormMax.Max(boxA.Max.NormMax),
-                boxB.Min.NormMax.Max(boxB.Max.NormMax));
-            if (boxA.EnlargedBy(tol).Intersects(boxB.EnlargedBy(tol)))
-                throw new NotImplementedException(
-                    "CSG of meshes with overlapping bounds is not implemented yet (M2); " +
-                    "only disjoint solids are supported in M0");
-
-            return new CsgArrangement(kernel, new[] { a, b }, o);
+            var pipeline = new Pipeline(kernel);
+            pipeline.Run();
+            return new CsgArrangement(kernel, pipeline, new[] { a, b }, o);
         }
 
-        /// <summary>Fragments of A outside B plus fragments of B outside A.</summary>
-        public PolyMesh[] Union() => Emit(_ => true);
+        /// <summary>Fragments of each solid outside the other.</summary>
+        public PolyMesh[] Union() => Emit((mesh, inside) => inside ? Selection.Drop : Selection.Keep);
 
-        /// <summary>Fragments of A inside B plus fragments of B inside A.</summary>
-        public PolyMesh[] Intersection() => Emit(_ => false);
+        /// <summary>Fragments of each solid inside the other.</summary>
+        public PolyMesh[] Intersection() => Emit((mesh, inside) => inside ? Selection.Keep : Selection.Drop);
 
         /// <summary>Fragments of A outside B plus flipped fragments of B inside A.</summary>
-        public PolyMesh[] Difference() => Emit(ti => m_kernel.TriMesh[ti] == 0);
+        public PolyMesh[] Difference() => Emit((mesh, inside) => mesh == 0
+            ? (inside ? Selection.Drop : Selection.Keep)
+            : (inside ? Selection.Flip : Selection.Drop));
 
-        /// <summary>Symmetric difference.</summary>
-        public PolyMesh[] Xor() => Emit(_ => true);
+        /// <summary>
+        /// Symmetric difference, emitted as the two lobes A∖B and B∖A. They
+        /// touch along the intersection curve, where a single merged surface
+        /// would be non-manifold — separate solids keep the manifold guarantee.
+        /// </summary>
+        public PolyMesh[] Xor() => Difference().Concat(
+            Emit((mesh, inside) => mesh == 1
+                ? (inside ? Selection.Drop : Selection.Keep)
+                : (inside ? Selection.Flip : Selection.Drop))).ToArray();
 
-        private PolyMesh[] Emit(Func<int, bool> select)
+        private enum Selection { Drop, Keep, Flip }
+
+        private PolyMesh[] Emit(Func<int, bool, Selection> select)
         {
-            var tris = new List<int>();
-            for (var ti = 0; ti < m_kernel.TriangleCount; ti++)
-                if (select(ti)) tris.Add(ti);
+            var tris = new List<EmitTri>();
+            for (var f = 0; f < m_pipeline.Fragments.Count; f++)
+            {
+                var frag = m_pipeline.Fragments[f];
+                var mesh = m_kernel.TriMesh[frag.Parent];
+                switch (select(mesh, m_pipeline.Inside[f]))
+                {
+                    case Selection.Drop: break;
+                    case Selection.Keep: tris.Add(new EmitTri(frag.V0, frag.V1, frag.V2, frag.Parent)); break;
+                    case Selection.Flip: tris.Add(new EmitTri(frag.V0, frag.V2, frag.V1, frag.Parent)); break;
+                    default: throw new InvalidOperationException();
+                }
+            }
             return Emitter.Emit(m_kernel, tris, m_sources, m_options.Verification == CsgVerification.Full);
         }
     }
 
+    internal readonly struct EmitTri
+    {
+        public readonly int V0, V1, V2;
+        public readonly int Parent;
+        public EmitTri(int v0, int v1, int v2, int parent) { V0 = v0; V1 = v1; V2 = v2; Parent = parent; }
+    }
+
     /// <summary>
-    /// Builds output PolyMeshes from a kernel triangle selection: one PolyMesh
-    /// per edge-connected component, with vertex/face/face-vertex attributes
-    /// back-mapped from the source meshes.
+    /// Builds output PolyMeshes from selected fragments: one PolyMesh per
+    /// edge-connected component. Attribute values at derived (cut) vertices are
+    /// synthesized by barycentric interpolation over the parent triangle —
+    /// evaluated once per output vertex, so interpolated channels cannot crack
+    /// across fragment seams.
     /// </summary>
     internal static class Emitter
     {
-        public static PolyMesh[] Emit(Kernel k, List<int> tris, PolyMesh[] sources, bool verify)
+        public static PolyMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
         {
             if (tris.Count == 0) return Array.Empty<PolyMesh>();
 
-            // components over kernel vertex ids (no compaction needed for this)
             var fia = new int[tris.Count + 1];
             var via = new int[tris.Count * 3];
             for (var i = 0; i < tris.Count; i++)
             {
-                var ti = tris[i];
                 fia[i + 1] = (i + 1) * 3;
-                via[i * 3] = k.T0[ti];
-                via[i * 3 + 1] = k.T1[ti];
-                via[i * 3 + 2] = k.T2[ti];
+                via[i * 3] = tris[i].V0;
+                via[i * 3 + 1] = tris[i].V1;
+                via[i * 3 + 2] = tris[i].V2;
             }
             var componentOfFace = new int[tris.Count];
             var componentCount = ManifoldChecks.EdgeConnectedComponents(fia, via, componentOfFace);
@@ -96,7 +130,7 @@ namespace Aardvark.Geometry
             var result = new PolyMesh[componentCount];
             for (var ci = 0; ci < componentCount; ci++)
             {
-                var componentTris = new List<int>();
+                var componentTris = new List<EmitTri>();
                 for (var i = 0; i < tris.Count; i++)
                     if (componentOfFace[i] == ci) componentTris.Add(tris[i]);
                 result[ci] = BuildPolyMesh(k, componentTris, sources, verify);
@@ -104,22 +138,19 @@ namespace Aardvark.Geometry
             return result;
         }
 
-        private static PolyMesh BuildPolyMesh(Kernel k, List<int> tris, PolyMesh[] sources, bool verify)
+        private static PolyMesh BuildPolyMesh(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
         {
             var triCount = tris.Count;
-
-            // compact vertices
             var localOfKernel = new Dictionary<int, int>();
             var kernelOfLocal = new List<int>();
             var via = new int[triCount * 3];
             var fia = new int[triCount + 1];
             for (var i = 0; i < triCount; i++)
             {
-                var ti = tris[i];
                 fia[i + 1] = (i + 1) * 3;
-                via[i * 3] = Local(k.T0[ti]);
-                via[i * 3 + 1] = Local(k.T1[ti]);
-                via[i * 3 + 2] = Local(k.T2[ti]);
+                via[i * 3] = Local(tris[i].V0);
+                via[i * 3 + 1] = Local(tris[i].V1);
+                via[i * 3 + 2] = Local(tris[i].V2);
             }
             int Local(int vi)
             {
@@ -134,6 +165,21 @@ namespace Aardvark.Geometry
             for (var li = 0; li < positions.Length; li++)
                 positions[li] = k.Positions[kernelOfLocal[li]];
 
+            // one representative (parent, barycentric) per output vertex for
+            // channel synthesis
+            var repParent = new int[kernelOfLocal.Count].Set(-1);
+            var repBary = new V3d[kernelOfLocal.Count];
+            foreach (var t in tris)
+            {
+                foreach (var vid in new[] { t.V0, t.V1, t.V2 })
+                {
+                    var li = localOfKernel[vid];
+                    if (repParent[li] >= 0) continue;
+                    repParent[li] = t.Parent;
+                    repBary[li] = Barycentric(k, t.Parent, k.Positions[vid]);
+                }
+            }
+
             var mesh = new PolyMesh
             {
                 PositionArray = positions,
@@ -141,7 +187,7 @@ namespace Aardvark.Geometry
                 VertexIndexArray = via,
             };
 
-            EmitVertexAttributes(k, mesh, kernelOfLocal, sources);
+            EmitVertexAttributes(k, mesh, kernelOfLocal, repParent, repBary, sources);
             EmitFaceAttributes(k, mesh, tris, sources);
             EmitFaceVertexAttributes(k, mesh, tris, sources);
             EmitInstanceAttributes(k, mesh, tris, sources);
@@ -155,11 +201,61 @@ namespace Aardvark.Geometry
             return mesh;
         }
 
-        /// <summary>
-        /// Channels usable for output: present in both sources with identical
-        /// element type, and non-indexed in both (indexed variants are handled
-        /// only for face-vertex attributes, where they are the convention).
-        /// </summary>
+        /// <summary>Barycentric coordinates of p in the parent triangle, computed in the parent plane's 2D projection.</summary>
+        private static V3d Barycentric(Kernel k, int parent, in V3d p)
+        {
+            var normal = k.Planes[k.TriPlane[parent]].Normal;
+            var a = Triangulator.ProjectDominant(normal, k.Positions[k.T0[parent]]);
+            var b = Triangulator.ProjectDominant(normal, k.Positions[k.T1[parent]]);
+            var c = Triangulator.ProjectDominant(normal, k.Positions[k.T2[parent]]);
+            var q = Triangulator.ProjectDominant(normal, p);
+            var area = Det(b - a, c - a);
+            if (area == 0.0) return new V3d(1, 0, 0);
+            var w0 = Det(b - q, c - q) / area;
+            var w1 = Det(c - q, a - q) / area;
+            return new V3d(w0, w1, 1.0 - w0 - w1);
+        }
+
+        private static double Det(in V2d u, in V2d v) => u.X * v.Y - u.Y * v.X;
+
+        /// <summary>Weighted combination of three source-array entries; falls back to nearest for non-interpolatable types.</summary>
+        private static object BaryValue(Array src, int i0, int i1, int i2, in V3d w, bool normalize)
+        {
+            switch (src)
+            {
+                case double[] a: return w.X * a[i0] + w.Y * a[i1] + w.Z * a[i2];
+                case float[] a: return (float)(w.X * a[i0] + w.Y * a[i1] + w.Z * a[i2]);
+                case V2d[] a: return w.X * a[i0] + w.Y * a[i1] + w.Z * a[i2];
+                case V3d[] a:
+                {
+                    var v = w.X * a[i0] + w.Y * a[i1] + w.Z * a[i2];
+                    return normalize && v != V3d.Zero ? v.Normalized : v;
+                }
+                case V4d[] a: return w.X * a[i0] + w.Y * a[i1] + w.Z * a[i2];
+                case V2f[] a: return (float)w.X * a[i0] + (float)w.Y * a[i1] + (float)w.Z * a[i2];
+                case V3f[] a:
+                {
+                    var v = (float)w.X * a[i0] + (float)w.Y * a[i1] + (float)w.Z * a[i2];
+                    return normalize && v != V3f.Zero ? v.Normalized : v;
+                }
+                case V4f[] a: return (float)w.X * a[i0] + (float)w.Y * a[i1] + (float)w.Z * a[i2];
+                case C3f[] a: return new C3f(
+                    (float)(w.X * a[i0].R + w.Y * a[i1].R + w.Z * a[i2].R),
+                    (float)(w.X * a[i0].G + w.Y * a[i1].G + w.Z * a[i2].G),
+                    (float)(w.X * a[i0].B + w.Y * a[i1].B + w.Z * a[i2].B));
+                case C4f[] a: return new C4f(
+                    (float)(w.X * a[i0].R + w.Y * a[i1].R + w.Z * a[i2].R),
+                    (float)(w.X * a[i0].G + w.Y * a[i1].G + w.Z * a[i2].G),
+                    (float)(w.X * a[i0].B + w.Y * a[i1].B + w.Z * a[i2].B),
+                    (float)(w.X * a[i0].A + w.Y * a[i1].A + w.Z * a[i2].A));
+                default:
+                {
+                    var nearest = w.X >= w.Y && w.X >= w.Z ? i0 : w.Y >= w.Z ? i1 : i2;
+                    return src.GetValue(nearest)!;
+                }
+            }
+        }
+
         private static IEnumerable<(Symbol Name, Array[] Arrays)> CommonChannels(
             SymbolDict<Array>[] dicts, Symbol skip = default)
         {
@@ -175,27 +271,30 @@ namespace Aardvark.Geometry
         }
 
         private static void EmitVertexAttributes(
-            Kernel k, PolyMesh mesh, List<int> kernelOfLocal, PolyMesh[] sources)
+            Kernel k, PolyMesh mesh, List<int> kernelOfLocal, int[] repParent, V3d[] repBary, PolyMesh[] sources)
         {
             var dicts = new[] { sources[0].VertexAttributes, sources[1].VertexAttributes };
             foreach (var (name, arrays) in CommonChannels(dicts, PolyMesh.Property.Positions))
             {
                 var elementType = arrays[0].GetType().GetElementType()!;
+                var normalize = name == PolyMesh.Property.Normals;
                 var target = Array.CreateInstance(elementType, kernelOfLocal.Count);
-                var ok = true;
                 for (var li = 0; li < kernelOfLocal.Count; li++)
                 {
-                    var vi = kernelOfLocal[li];
-                    var mi = k.VertexSourceMesh(vi);
-                    if (mi < 0) { ok = false; break; } // derived vertex: needs interpolation (M2)
-                    target.SetValue(arrays[mi].GetValue(vi - k.VertexOffset[mi]), li);
+                    var parent = repParent[li];
+                    var mi = k.TriMesh[parent];
+                    var src = sources[mi];
+                    var i0 = src.VertexIndexArray[k.C0[parent]];
+                    var i1 = src.VertexIndexArray[k.C1[parent]];
+                    var i2 = src.VertexIndexArray[k.C2[parent]];
+                    target.SetValue(BaryValue(arrays[mi], i0, i1, i2, repBary[li], normalize), li);
                 }
-                if (ok) mesh.VertexAttributes[name] = target;
+                mesh.VertexAttributes[name] = target;
             }
         }
 
         private static void EmitFaceAttributes(
-            Kernel k, PolyMesh mesh, List<int> tris, PolyMesh[] sources)
+            Kernel k, PolyMesh mesh, List<EmitTri> tris, PolyMesh[] sources)
         {
             var dicts = new[] { sources[0].FaceAttributes, sources[1].FaceAttributes };
             foreach (var (name, arrays) in CommonChannels(dicts))
@@ -204,19 +303,19 @@ namespace Aardvark.Geometry
                 var target = Array.CreateInstance(elementType, tris.Count);
                 for (var i = 0; i < tris.Count; i++)
                 {
-                    var ti = tris[i];
-                    target.SetValue(arrays[k.TriMesh[ti]].GetValue(k.TriFace[ti]), i);
+                    var parent = tris[i].Parent;
+                    target.SetValue(arrays[k.TriMesh[parent]].GetValue(k.TriFace[parent]), i);
                 }
                 mesh.FaceAttributes[name] = target;
             }
         }
 
         private static void EmitFaceVertexAttributes(
-            Kernel k, PolyMesh mesh, List<int> tris, PolyMesh[] sources)
+            Kernel k, PolyMesh mesh, List<EmitTri> tris, PolyMesh[] sources)
         {
-            // face-vertex channels may be indexed (name = values + -name = indices)
-            // or per-slot; output is always emitted in indexed form with the two
-            // sources' value arrays concatenated.
+            // face-vertex channels may be indexed (name = values + -name = index)
+            // or per-slot; output is emitted in indexed form over the two
+            // sources' concatenated value arrays plus synthesized cut values
             var dicts = new[] { sources[0].FaceVertexAttributes, sources[1].FaceVertexAttributes };
             foreach (var name in dicts[0].Keys.ToArray())
             {
@@ -225,47 +324,58 @@ namespace Aardvark.Geometry
                 if (!dicts[1].TryGetValue(name, out var v1) || v1 == null) continue;
                 var elementType = v0.GetType().GetElementType();
                 if (elementType == null || elementType != v1.GetType().GetElementType()) continue;
-                var idx0 = dicts[0].GetOrDefault(-name) as int[];
-                var idx1 = dicts[1].GetOrDefault(-name) as int[];
+                var idx = new[] { dicts[0].GetOrDefault(-name) as int[], dicts[1].GetOrDefault(-name) as int[] };
+                var normalize = name == PolyMesh.Property.Normals;
 
-                var values = Array.CreateInstance(elementType, v0.Length + v1.Length);
-                Array.Copy(v0, 0, values, 0, v0.Length);
-                Array.Copy(v1, 0, values, v0.Length, v1.Length);
-
+                var extra = new List<object>();
                 var indices = new int[tris.Count * 3];
-                var ok = true;
-                for (var i = 0; i < tris.Count && ok; i++)
+                var baseLength = v0.Length + v1.Length;
+                for (var i = 0; i < tris.Count; i++)
                 {
-                    var ti = tris[i];
-                    var mi = k.TriMesh[ti];
-                    var idx = mi == 0 ? idx0 : idx1;
+                    var t = tris[i];
+                    var parent = t.Parent;
+                    var mi = k.TriMesh[parent];
+                    var values = mi == 0 ? v0 : v1;
                     var offset = mi == 0 ? 0 : v0.Length;
-                    ok &= MapCorner(k.C0[ti], idx, offset, indices, i * 3);
-                    ok &= MapCorner(k.C1[ti], idx, offset, indices, i * 3 + 1);
-                    ok &= MapCorner(k.C2[ti], idx, offset, indices, i * 3 + 2);
+                    int SlotValueIndex(int slot) => idx[mi] != null ? idx[mi]![slot] : slot;
+
+                    Span<int> corner = stackalloc int[] { t.V0, t.V1, t.V2 };
+                    for (var c = 0; c < 3; c++)
+                    {
+                        int at;
+                        if (corner[c] == k.T0[parent]) at = offset + SlotValueIndex(k.C0[parent]);
+                        else if (corner[c] == k.T1[parent]) at = offset + SlotValueIndex(k.C1[parent]);
+                        else if (corner[c] == k.T2[parent]) at = offset + SlotValueIndex(k.C2[parent]);
+                        else
+                        {
+                            var w = BarycentricOf(k, parent, k.Positions[corner[c]]);
+                            extra.Add(BaryValue(values,
+                                SlotValueIndex(k.C0[parent]), SlotValueIndex(k.C1[parent]), SlotValueIndex(k.C2[parent]),
+                                w, normalize));
+                            at = baseLength + extra.Count - 1;
+                        }
+                        indices[i * 3 + c] = at;
+                    }
                 }
-                if (!ok) continue; // derived corner: needs interpolation (M2)
 
-                mesh.FaceVertexAttributes[name] = values;
+                var all = Array.CreateInstance(elementType, baseLength + extra.Count);
+                Array.Copy(v0, 0, all, 0, v0.Length);
+                Array.Copy(v1, 0, all, v0.Length, v1.Length);
+                for (var e = 0; e < extra.Count; e++) all.SetValue(extra[e], baseLength + e);
+
+                mesh.FaceVertexAttributes[name] = all;
                 mesh.FaceVertexAttributes[-name] = indices;
-            }
-
-            static bool MapCorner(int slot, int[]? sourceIndex, int offset, int[] target, int at)
-            {
-                if (slot < 0) return false;
-                target[at] = offset + (sourceIndex != null ? sourceIndex[slot] : slot);
-                return true;
             }
         }
 
+        private static V3d BarycentricOf(Kernel k, int parent, in V3d p) => Barycentric(k, parent, p);
+
         private static void EmitInstanceAttributes(
-            Kernel k, PolyMesh mesh, List<int> tris, PolyMesh[] sources)
+            Kernel k, PolyMesh mesh, List<EmitTri> tris, PolyMesh[] sources)
         {
-            // a component that stems from a single input keeps that input's
-            // instance attributes; mixed components inherit A's
-            var mi = k.TriMesh[tris[0]];
+            var mi = k.TriMesh[tris[0].Parent];
             for (var i = 1; i < tris.Count; i++)
-                if (k.TriMesh[tris[i]] != mi) { mi = 0; break; }
+                if (k.TriMesh[tris[i].Parent] != mi) { mi = 0; break; }
             foreach (var name in sources[mi].InstanceAttributes.Keys.ToArray())
                 mesh.InstanceAttributes[name] = sources[mi].InstanceAttributes[name];
         }
