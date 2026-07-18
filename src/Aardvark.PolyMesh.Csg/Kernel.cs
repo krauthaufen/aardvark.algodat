@@ -1,0 +1,143 @@
+using System;
+using System.Collections.Generic;
+using Aardvark.Base;
+
+namespace Aardvark.Geometry
+{
+    /// <summary>
+    /// The kernel's SoA working representation: flat vertex/triangle/plane
+    /// arrays for both input meshes, with provenance for attribute back-mapping.
+    /// Input vertices keep their identity (kernel vertex id = input vertex id +
+    /// per-mesh offset); cut vertices are appended with a higher tolerance
+    /// generation as the pipeline proceeds.
+    /// </summary>
+    internal sealed class Kernel
+    {
+        public readonly Eps Eps;
+
+        // vertices
+        public readonly List<V3d> Positions = new();
+        public readonly List<byte> Generation = new();
+
+        // triangles (SoA, parallel lists)
+        public readonly List<int> T0 = new(), T1 = new(), T2 = new();
+        public readonly List<int> TriPlane = new();
+        public readonly List<byte> TriMesh = new();  // source mesh: 0 = A, 1 = B
+        public readonly List<int> TriFace = new();   // source face index in that mesh
+        public readonly List<int> C0 = new(), C1 = new(), C2 = new(); // source face-vertex slot per corner, -1 = none
+
+        // planes (one per source polygon in M0; canonicalized across meshes in M1)
+        public readonly List<Plane3d> Planes = new();
+
+        // per input mesh
+        public readonly int[] VertexOffset = new int[2];
+        public readonly int[] VertexCount = new int[2];
+        public readonly Range1i[] TriRange = new Range1i[2];
+        public readonly Box3d[] Bounds = new Box3d[2];
+
+        public Kernel(Eps eps) => Eps = eps;
+
+        public int TriangleCount => T0.Count;
+
+        /// <summary>Source mesh (0/1) of a kernel vertex, or -1 for derived vertices.</summary>
+        public int VertexSourceMesh(int vi)
+        {
+            if (vi >= VertexOffset[1] && vi < VertexOffset[1] + VertexCount[1]) return 1;
+            if (vi >= VertexOffset[0] && vi < VertexOffset[0] + VertexCount[0]) return 0;
+            return -1;
+        }
+
+        /// <summary>
+        /// Ingests one input mesh: verifies the watertight-manifold contract,
+        /// computes one Newell plane per face (checking planarity against it),
+        /// triangulates polygonal faces by ear clipping, and appends everything
+        /// to the kernel arrays.
+        /// </summary>
+        public void Ingest(PolyMesh mesh, int meshIndex)
+        {
+            var fia = mesh.FirstIndexArray ?? throw new CsgInputException("mesh has no FirstIndexArray");
+            var via = mesh.VertexIndexArray ?? throw new CsgInputException("mesh has no VertexIndexArray");
+            var pos = mesh.PositionArray ?? throw new CsgInputException("mesh has no PositionArray");
+            var faceCount = fia.Length - 1;
+
+            var violation = ManifoldChecks.FindManifoldViolation(fia, via, pos.Length);
+            if (violation != null)
+                throw new CsgInputException($"input mesh {(meshIndex == 0 ? "A" : "B")} is not a closed manifold: {violation}");
+
+            var vertexOffset = Positions.Count;
+            VertexOffset[meshIndex] = vertexOffset;
+            VertexCount[meshIndex] = pos.Length;
+            var bounds = Box3d.Invalid;
+            for (var i = 0; i < pos.Length; i++)
+            {
+                Positions.Add(pos[i]);
+                Generation.Add(0);
+                bounds.ExtendBy(pos[i]);
+            }
+            Bounds[meshIndex] = bounds;
+
+            var triStart = TriangleCount;
+            var polygon = new List<V3d>();
+            var polygon2d = new List<V2d>();
+            var earTris = new List<(int I0, int I1, int I2)>();
+
+            for (var fi = 0; fi < faceCount; fi++)
+            {
+                var start = fia[fi]; var end = fia[fi + 1];
+                var fvc = end - start;
+
+                polygon.Clear();
+                for (var i = start; i < end; i++) polygon.Add(pos[via[i]]);
+
+                var plane = Triangulator.NewellPlane(CollectionsMarshalAsSpan(polygon));
+                if (plane.Normal == V3d.Zero)
+                    throw new CsgInputException($"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} is degenerate (zero Newell normal)");
+                for (var i = 0; i < fvc; i++)
+                {
+                    if (Eps.HeightSign(plane, polygon[i]) != Sign3.On)
+                        throw new CsgInputException(
+                            $"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} is not planar within tolerance " +
+                            $"(vertex {via[start + i]} off its face plane)");
+                }
+                var planeIndex = Planes.Count;
+                Planes.Add(plane);
+
+                if (fvc == 3)
+                {
+                    AddTriangle(
+                        vertexOffset + via[start], vertexOffset + via[start + 1], vertexOffset + via[start + 2],
+                        planeIndex, meshIndex, fi, start, start + 1, start + 2);
+                }
+                else
+                {
+                    polygon2d.Clear();
+                    for (var i = 0; i < fvc; i++)
+                        polygon2d.Add(Triangulator.ProjectDominant(plane.Normal, polygon[i]));
+                    earTris.Clear();
+                    if (!Triangulator.EarClip(CollectionsMarshalAsSpan(polygon2d), Eps, earTris))
+                        throw new CsgInputException(
+                            $"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} could not be triangulated (self-intersecting?)");
+                    foreach (var (i0, i1, i2) in earTris)
+                    {
+                        AddTriangle(
+                            vertexOffset + via[start + i0], vertexOffset + via[start + i1], vertexOffset + via[start + i2],
+                            planeIndex, meshIndex, fi, start + i0, start + i1, start + i2);
+                    }
+                }
+            }
+            TriRange[meshIndex] = new Range1i(triStart, TriangleCount - 1);
+        }
+
+        private void AddTriangle(int v0, int v1, int v2, int plane, int meshIndex, int face, int c0, int c1, int c2)
+        {
+            T0.Add(v0); T1.Add(v1); T2.Add(v2);
+            TriPlane.Add(plane);
+            TriMesh.Add((byte)meshIndex);
+            TriFace.Add(face);
+            C0.Add(c0); C1.Add(c1); C2.Add(c2);
+        }
+
+        private static ReadOnlySpan<T> CollectionsMarshalAsSpan<T>(List<T> list)
+            => System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
+    }
+}

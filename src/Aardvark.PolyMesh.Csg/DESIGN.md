@@ -41,8 +41,9 @@ Failure to verify throws `CsgVerificationException` — never a silent bad mesh.
 
 ### Relative tolerance
 
-One user-facing knob: `RelativeEpsilon` (default ~1e-9; doubles have 1e-16
-relative resolution, leaving 7 orders of headroom for accumulated error).
+One user-facing knob: `RelativeEpsilon` (default 1e-11: ~4 orders of magnitude
+above accumulated double rounding noise, while still preserving micrometer
+detail at 10 km offsets).
 
 Point–plane test for vertex `v` against unit-normal plane `(n, d)`:
 
@@ -58,6 +59,10 @@ fp uncertainty scale together — this is what makes the model offset-invariant:
 at offset 1e7 the representable grid is coarser and tol grows with it.
 
 Vertex–vertex coincidence: `|a-b|∞ ≤ eps · (|a|∞ + |b|∞)`.
+2D orientation (ear clipping, in-plane booleans): `tol = eps · (m + L) · L` with
+m = max coordinate magnitude and L = max edge extent — the propagation of
+per-coordinate slop eps·m through the determinant; never eps·m², which would
+swallow everything far from the origin.
 Plane–plane coincidence: unit normals within angular eps AND each plane's
 offset within the point–plane tol of the other (tested via sample points on
 the actual face, not just |d| — offsets far from a face's support are meaningless).
@@ -171,17 +176,21 @@ point, no sliver), and collinear edge overlaps produce shared sub-edges.
 ```csharp
 public static class Csg
 {
-    public static PolyMesh Union(PolyMesh a, PolyMesh b, CsgOptions? o = null);
-    public static PolyMesh Intersection(PolyMesh a, PolyMesh b, CsgOptions? o = null);
-    public static PolyMesh Difference(PolyMesh a, PolyMesh b, CsgOptions? o = null);
-    public static PolyMesh Xor(PolyMesh a, PolyMesh b, CsgOptions? o = null);
+    // one PolyMesh per edge-connected output component: multi-part results
+    // (union of disjoint solids, xor) come back as separate clean solids, and
+    // solids touching only at a vertex stay two components instead of sharing
+    // a non-manifold vertex
+    public static PolyMesh[] Union(PolyMesh a, PolyMesh b, CsgOptions? o = null);
+    public static PolyMesh[] Intersection(PolyMesh a, PolyMesh b, CsgOptions? o = null);
+    public static PolyMesh[] Difference(PolyMesh a, PolyMesh b, CsgOptions? o = null);
+    public static PolyMesh[] Xor(PolyMesh a, PolyMesh b, CsgOptions? o = null);
     // one arrangement, four selections:
     public static CsgArrangement Arrange(PolyMesh a, PolyMesh b, CsgOptions? o = null);
 }
 
 public sealed class CsgOptions
 {
-    public double RelativeEpsilon = 1e-9;
+    public double RelativeEpsilon = 1e-11;
     public CsgVerification Verification = CsgVerification.Full; // Full | InputOnly | None
     public SymbolDict<object>? AttributeInterpolators;          // per-channel overrides
 }
