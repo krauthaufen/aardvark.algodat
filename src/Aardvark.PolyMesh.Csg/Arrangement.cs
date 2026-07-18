@@ -166,10 +166,12 @@ namespace Aardvark.Geometry
 
         /// <summary>
         /// Edge-connected components of the selected triangles. At edges where
-        /// more than two triangles meet (solids touching along a curve),
-        /// connectivity is restricted to triangles of the same source mesh, so
-        /// touching solids separate into individually manifold components
-        /// instead of one non-manifold soup.
+        /// more than two triangles meet (result volumes touching along a
+        /// curve), incident faces are paired by dihedral angle: sorted around
+        /// the edge axis, a face traversing the edge v→u followed (CCW) by one
+        /// traversing u→v bound one solid wedge and are connected. Touching
+        /// volumes thus separate into individually manifold components instead
+        /// of one non-manifold soup.
         /// </summary>
         private static int MeshAwareComponents(Kernel k, List<EmitTri> tris, int[] componentOfFace)
         {
@@ -183,7 +185,7 @@ namespace Aardvark.Geometry
             static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
 
             var adjacency = new List<int>[tris.Count].SetByIndex(_ => new List<int>());
-            foreach (var list in edgeTris.Values)
+            foreach (var (edge, list) in edgeTris)
             {
                 if (list.Count == 2)
                 {
@@ -192,15 +194,37 @@ namespace Aardvark.Geometry
                 }
                 else if (list.Count > 2)
                 {
-                    for (var m = 0; m < 2; m++)
+                    var (u, v) = edge;
+                    var d = (k.Positions[v] - k.Positions[u]).Normalized;
+                    var ax0 = d.X.Abs() < 0.9 ? V3d.XAxis : V3d.YAxis;
+                    var ax1 = d.Cross(ax0).Normalized;
+                    var ax2 = d.Cross(ax1);
+
+                    // per incident face: angle of its third vertex around the
+                    // edge axis, and whether it traverses the edge u->v
+                    var around = list.Map(i =>
                     {
-                        var group = list.Where(i => k.TriMesh[tris[i].Parent] == m).ToArray();
-                        if (group.Length == 2)
+                        var t = tris[i];
+                        var w = t.V0 != u && t.V0 != v ? t.V0 : t.V1 != u && t.V1 != v ? t.V1 : t.V2;
+                        var r = k.Positions[w] - k.Positions[u];
+                        var angle = Fun.Atan2(r.Dot(ax2), r.Dot(ax1));
+                        var forward = (t.V0 == u && t.V1 == v) || (t.V1 == u && t.V2 == v) || (t.V2 == u && t.V0 == v);
+                        return (Tri: i, Angle: angle, Forward: forward);
+                    }).ToArray();
+                    Array.Sort(around, (x, y) => x.Angle.CompareTo(y.Angle));
+
+                    for (var i = 0; i < around.Length; i++)
+                    {
+                        var a = around[i];
+                        var b = around[(i + 1) % around.Length];
+                        if (!a.Forward && b.Forward)
                         {
-                            adjacency[group[0]].Add(group[1]);
-                            adjacency[group[1]].Add(group[0]);
+                            adjacency[a.Tri].Add(b.Tri);
+                            adjacency[b.Tri].Add(a.Tri);
                         }
-                        // other counts: leave unconnected, per-component verify reports if truly broken
+                        // other consecutive combinations either bound void
+                        // sectors or indicate genuinely broken input; the
+                        // per-component verifier reports the latter
                     }
                 }
             }

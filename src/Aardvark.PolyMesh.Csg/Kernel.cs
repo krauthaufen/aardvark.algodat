@@ -76,13 +76,18 @@ namespace Aardvark.Geometry
             VertexOffset[meshIndex] = vertexOffset;
             VertexCount[meshIndex] = pos.Length;
             var bounds = Box3d.Invalid;
+            var maxMag = Eps.Scene;
             for (var i = 0; i < pos.Length; i++)
             {
                 Positions.Add(pos[i]);
                 Generation.Add(0);
                 bounds.ExtendBy(pos[i]);
+                maxMag = maxMag.Max(pos[i].NormMax);
             }
             Bounds[meshIndex] = bounds;
+            // the scene scale must be known before any plane test (planarity
+            // below), or tolerances collapse for faces passing near the origin
+            Eps = Eps.WithScene(maxMag);
 
             var triStart = TriangleCount;
             var polygon = new List<V3d>();
