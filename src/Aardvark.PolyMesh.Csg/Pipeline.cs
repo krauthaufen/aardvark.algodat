@@ -212,8 +212,13 @@ namespace Aardvark.Geometry
             if (AllStrict(sa, Sign3.Above) || AllStrict(sa, Sign3.Below)) return;
 
             if (AllOn(sa) && AllOn(sb))
+            {
+                // tangent contact without 2D interior overlap (solids sharing a
+                // plane strip, an edge, a corner) needs no arrangement at all
+                if (!CoplanarInteriorsOverlap(va, vb, pa)) return;
                 throw new NotImplementedException(
-                    "coplanar face pairs are not implemented yet (M4)");
+                    "coplanar face pairs with overlapping interiors are not implemented yet (M4)");
+            }
 
             var crossA = CrossingPoints(va, sa, pb);
             var crossB = CrossingPoints(vb, sb, pa);
@@ -240,6 +245,45 @@ namespace Aardvark.Geometry
 
         private static bool AllStrict(Span<Sign3> s, Sign3 v) => s[0] == v && s[1] == v && s[2] == v;
         private static bool AllOn(Span<Sign3> s) => s[0] == Sign3.On && s[1] == Sign3.On && s[2] == Sign3.On;
+
+        /// <summary>2D separating-edge test for two coplanar triangles; touching along boundary counts as not overlapping.</summary>
+        private bool CoplanarInteriorsOverlap(Span<int> va, Span<int> vb, int plane)
+        {
+            var n = m_kernel.Planes[plane].Normal;
+            Span<V2d> a = stackalloc V2d[3];
+            Span<V2d> b = stackalloc V2d[3];
+            for (var i = 0; i < 3; i++)
+            {
+                a[i] = Triangulator.ProjectDominant(n, m_kernel.Positions[va[i]]);
+                b[i] = Triangulator.ProjectDominant(n, m_kernel.Positions[vb[i]]);
+            }
+            if (!MakeCcw(a) || !MakeCcw(b)) return false; // degenerate projection
+            return !HasSeparatingEdge(a, b) && !HasSeparatingEdge(b, a);
+        }
+
+        private bool MakeCcw(Span<V2d> t)
+        {
+            switch (m_eps.AreaSign(t[0], t[1], t[2]))
+            {
+                case Sign3.Above: return true;
+                case Sign3.Below: (t[1], t[2]) = (t[2], t[1]); return true;
+                case Sign3.On: return false;
+                default: throw new InvalidOperationException();
+            }
+        }
+
+        private bool HasSeparatingEdge(Span<V2d> p, Span<V2d> q)
+        {
+            for (var i = 0; i < 3; i++)
+            {
+                var u = p[i]; var v = p[(i + 1) % 3];
+                var separated = true;
+                for (var j = 0; j < 3 && separated; j++)
+                    if (m_eps.AreaSign(u, v, q[j]) == Sign3.Above) separated = false;
+                if (separated) return true;
+            }
+            return false;
+        }
 
         /// <summary>Crossing points of a triangle with the other triangle's plane: On-vertices and strict sign-change edge cuts.</summary>
         private List<CrossPt> CrossingPoints(Span<int> v, Span<Sign3> s, int plane)

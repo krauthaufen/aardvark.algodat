@@ -115,17 +115,8 @@ namespace Aardvark.Geometry
         {
             if (tris.Count == 0) return Array.Empty<PolyMesh>();
 
-            var fia = new int[tris.Count + 1];
-            var via = new int[tris.Count * 3];
-            for (var i = 0; i < tris.Count; i++)
-            {
-                fia[i + 1] = (i + 1) * 3;
-                via[i * 3] = tris[i].V0;
-                via[i * 3 + 1] = tris[i].V1;
-                via[i * 3 + 2] = tris[i].V2;
-            }
             var componentOfFace = new int[tris.Count];
-            var componentCount = ManifoldChecks.EdgeConnectedComponents(fia, via, componentOfFace);
+            var componentCount = MeshAwareComponents(k, tris, componentOfFace);
 
             var result = new PolyMesh[componentCount];
             for (var ci = 0; ci < componentCount; ci++)
@@ -136,6 +127,66 @@ namespace Aardvark.Geometry
                 result[ci] = BuildPolyMesh(k, componentTris, sources, verify);
             }
             return result;
+        }
+
+        /// <summary>
+        /// Edge-connected components of the selected triangles. At edges where
+        /// more than two triangles meet (solids touching along a curve),
+        /// connectivity is restricted to triangles of the same source mesh, so
+        /// touching solids separate into individually manifold components
+        /// instead of one non-manifold soup.
+        /// </summary>
+        private static int MeshAwareComponents(Kernel k, List<EmitTri> tris, int[] componentOfFace)
+        {
+            var edgeTris = new Dictionary<(int, int), List<int>>();
+            for (var i = 0; i < tris.Count; i++)
+            {
+                var t = tris[i];
+                foreach (var e in new[] { Key(t.V0, t.V1), Key(t.V1, t.V2), Key(t.V2, t.V0) })
+                    edgeTris.GetOrCreate(e, _ => new List<int>()).Add(i);
+            }
+            static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
+
+            var adjacency = new List<int>[tris.Count].SetByIndex(_ => new List<int>());
+            foreach (var list in edgeTris.Values)
+            {
+                if (list.Count == 2)
+                {
+                    adjacency[list[0]].Add(list[1]);
+                    adjacency[list[1]].Add(list[0]);
+                }
+                else if (list.Count > 2)
+                {
+                    for (var m = 0; m < 2; m++)
+                    {
+                        var group = list.Where(i => k.TriMesh[tris[i].Parent] == m).ToArray();
+                        if (group.Length == 2)
+                        {
+                            adjacency[group[0]].Add(group[1]);
+                            adjacency[group[1]].Add(group[0]);
+                        }
+                        // other counts: leave unconnected, per-component verify reports if truly broken
+                    }
+                }
+            }
+
+            componentOfFace.Set(-1);
+            var componentCount = 0;
+            var stack = new Stack<int>();
+            for (var seed = 0; seed < tris.Count; seed++)
+            {
+                if (componentOfFace[seed] >= 0) continue;
+                var ci = componentCount++;
+                componentOfFace[seed] = ci;
+                stack.Push(seed);
+                while (stack.Count > 0)
+                {
+                    var i = stack.Pop();
+                    foreach (var j in adjacency[i])
+                        if (componentOfFace[j] < 0) { componentOfFace[j] = ci; stack.Push(j); }
+                }
+            }
+            return componentCount;
         }
 
         private static PolyMesh BuildPolyMesh(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
