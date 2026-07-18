@@ -53,37 +53,72 @@ namespace Aardvark.Geometry
             return new CsgArrangement(kernel, pipeline, new[] { a, b }, o);
         }
 
-        /// <summary>Fragments of each solid outside the other.</summary>
-        public PolyMesh[] Union() => Emit((mesh, inside) => inside ? Selection.Drop : Selection.Keep);
+        // Coincident (coplanar) surface regions exist once in each input; the
+        // selection keeps A's copy when the region belongs to the result
+        // (OnSame for union/intersection) and drops B's, so the region is
+        // emitted exactly once.
 
-        /// <summary>Fragments of each solid inside the other.</summary>
-        public PolyMesh[] Intersection() => Emit((mesh, inside) => inside ? Selection.Keep : Selection.Drop);
+        /// <summary>Fragments of each solid outside the other; coincident same-facing regions kept once.</summary>
+        public PolyMesh[] Union() => Emit((mesh, label) => label switch
+        {
+            FragLabel.Outside => Selection.Keep,
+            FragLabel.Inside => Selection.Drop,
+            FragLabel.OnSame => mesh == 0 ? Selection.Keep : Selection.Drop,
+            FragLabel.OnOpposite => Selection.Drop,
+            _ => throw new InvalidOperationException(),
+        });
 
-        /// <summary>Fragments of A outside B plus flipped fragments of B inside A.</summary>
-        public PolyMesh[] Difference() => Emit((mesh, inside) => mesh == 0
-            ? (inside ? Selection.Drop : Selection.Keep)
-            : (inside ? Selection.Flip : Selection.Drop));
+        /// <summary>Fragments of each solid inside the other; coincident same-facing regions kept once.</summary>
+        public PolyMesh[] Intersection() => Emit((mesh, label) => label switch
+        {
+            FragLabel.Outside => Selection.Drop,
+            FragLabel.Inside => Selection.Keep,
+            FragLabel.OnSame => mesh == 0 ? Selection.Keep : Selection.Drop,
+            FragLabel.OnOpposite => Selection.Drop,
+            _ => throw new InvalidOperationException(),
+        });
+
+        /// <summary>A∖B: A outside B (plus A's faces where B touches from outside), B inside A flipped.</summary>
+        public PolyMesh[] Difference() => Emit(DifferenceSelect(0));
 
         /// <summary>
         /// Symmetric difference, emitted as the two lobes A∖B and B∖A. They
         /// touch along the intersection curve, where a single merged surface
         /// would be non-manifold — separate solids keep the manifold guarantee.
         /// </summary>
-        public PolyMesh[] Xor() => Difference().Concat(
-            Emit((mesh, inside) => mesh == 1
-                ? (inside ? Selection.Drop : Selection.Keep)
-                : (inside ? Selection.Flip : Selection.Drop))).ToArray();
+        public PolyMesh[] Xor() => Difference().Concat(Emit(DifferenceSelect(1))).ToArray();
+
+        private static Func<int, FragLabel, Selection> DifferenceSelect(int keptMesh) => (mesh, label) =>
+        {
+            if (mesh == keptMesh)
+                return label switch
+                {
+                    FragLabel.Outside => Selection.Keep,
+                    FragLabel.Inside => Selection.Drop,
+                    FragLabel.OnSame => Selection.Drop,      // covered by the subtrahend from the same side
+                    FragLabel.OnOpposite => Selection.Keep,  // subtrahend only touches from outside
+                    _ => throw new InvalidOperationException(),
+                };
+            return label switch
+            {
+                FragLabel.Outside => Selection.Drop,
+                FragLabel.Inside => Selection.Flip,
+                FragLabel.OnSame => Selection.Drop,
+                FragLabel.OnOpposite => Selection.Drop,
+                _ => throw new InvalidOperationException(),
+            };
+        };
 
         private enum Selection { Drop, Keep, Flip }
 
-        private PolyMesh[] Emit(Func<int, bool, Selection> select)
+        private PolyMesh[] Emit(Func<int, FragLabel, Selection> select)
         {
             var tris = new List<EmitTri>();
             for (var f = 0; f < m_pipeline.Fragments.Count; f++)
             {
                 var frag = m_pipeline.Fragments[f];
                 var mesh = m_kernel.TriMesh[frag.Parent];
-                switch (select(mesh, m_pipeline.Inside[f]))
+                switch (select(mesh, m_pipeline.Labels[f]))
                 {
                     case Selection.Drop: break;
                     case Selection.Keep: tris.Add(new EmitTri(frag.V0, frag.V1, frag.V2, frag.Parent)); break;

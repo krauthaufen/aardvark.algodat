@@ -4,6 +4,17 @@ using Aardvark.Base;
 
 namespace Aardvark.Geometry
 {
+    /// <summary>Classification of a fragment against the other solid.</summary>
+    internal enum FragLabel : byte
+    {
+        Outside,
+        Inside,
+        /// <summary>Coplanar with a facet of the other solid, normals aligned.</summary>
+        OnSame,
+        /// <summary>Coplanar with a facet of the other solid, normals opposed.</summary>
+        OnOpposite,
+    }
+
     /// <summary>One output triangle fragment: canonical vertex ids + the kernel triangle it stems from.</summary>
     internal readonly struct Fragment
     {
@@ -25,8 +36,7 @@ namespace Aardvark.Geometry
         /// <summary>kernel vertex id → canonical vertex id (weld representative)</summary>
         public int[] Canon = Array.Empty<int>();
         public readonly List<Fragment> Fragments = new();
-        /// <summary>per fragment: true = inside the other solid</summary>
-        public readonly List<bool> Inside = new();
+        public readonly List<FragLabel> Labels = new();
 
         private readonly Dictionary<long, Sign3> m_signCache = new();
         private readonly Dictionary<(int, int, int), int> m_cutCache = new(); // (edgeMin, edgeMax, planeId) -> vid
@@ -40,6 +50,7 @@ namespace Aardvark.Geometry
         private readonly Dictionary<(int, int), HashSet<int>> m_edgePoints = new(); // canonical edge -> points on it
         private readonly Dictionary<int, HashSet<(int, int)>> m_faceConstraints = new(); // kernel tri -> segments
         private readonly HashSet<(int, int)>[] m_barriers = { new(), new() }; // per mesh: constraint sub-edges
+        private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
 
         public Pipeline(Kernel kernel)
         {
@@ -216,8 +227,13 @@ namespace Aardvark.Geometry
                 // tangent contact without 2D interior overlap (solids sharing a
                 // plane strip, an edge, a corner) needs no arrangement at all
                 if (!CoplanarInteriorsOverlap(va, vb, pa)) return;
-                throw new NotImplementedException(
-                    "coplanar face pairs with overlapping interiors are not implemented yet (M4)");
+                // overlapping coplanar facets: subdivision happens via the
+                // side-face pairs (every facet boundary edge also belongs to a
+                // non-coplanar face); here we only record coverage for labeling
+                var same = m_kernel.Planes[pa].Normal.Dot(m_kernel.Planes[pb].Normal) > 0;
+                m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, same));
+                m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, same));
+                return;
             }
 
             var crossA = CrossingPoints(va, sa, pb);
@@ -473,9 +489,26 @@ namespace Aardvark.Geometry
                     edgeToFragments[mesh].GetOrCreate(e, _ => new List<int>()).Add(f);
             }
 
-            Inside.Clear();
-            for (var f = 0; f < Fragments.Count; f++) Inside.Add(false);
+            Labels.Clear();
+            for (var f = 0; f < Fragments.Count; f++) Labels.Add(FragLabel.Outside);
             var labeled = new bool[Fragments.Count];
+
+            // coplanar-covered fragments are labeled directly (their coverage
+            // boundary is made of constraint edges, so they are flood-isolated)
+            for (var f = 0; f < Fragments.Count; f++)
+            {
+                var frag = Fragments[f];
+                var partners = m_coplanar.GetOrDefault(frag.Parent);
+                if (partners == null) continue;
+                var centroid = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
+                foreach (var (partner, same) in partners)
+                {
+                    if (!CoplanarCovers(partner, centroid)) continue;
+                    Labels[f] = same ? FragLabel.OnSame : FragLabel.OnOpposite;
+                    labeled[f] = true;
+                    break;
+                }
+            }
 
             for (var seedFrag = 0; seedFrag < Fragments.Count; seedFrag++)
             {
@@ -502,8 +535,31 @@ namespace Aardvark.Geometry
                 }
 
                 var inside = RegionIsInsideOther(region, 1 - mesh);
-                foreach (var f in region) Inside[f] = inside;
+                foreach (var f in region) Labels[f] = inside ? FragLabel.Inside : FragLabel.Outside;
             }
+        }
+
+        /// <summary>
+        /// True if p (a point in the shared plane) lies inside or on the
+        /// partner triangle. On counts as inside: a fragment centroid can sit
+        /// exactly on a partner's internal diagonal (matching triangulations of
+        /// coincident quads), while the outer boundary of a covered region is
+        /// always made of constraint edges, which fragments never straddle —
+        /// so an On answer here can only mean "on an interior edge of the
+        /// covered region".
+        /// </summary>
+        private bool CoplanarCovers(int partner, in V3d p)
+        {
+            var n = m_kernel.Planes[m_kernel.TriPlane[partner]].Normal;
+            Span<V2d> t = stackalloc V2d[3];
+            t[0] = Triangulator.ProjectDominant(n, m_kernel.Positions[m_kernel.T0[partner]]);
+            t[1] = Triangulator.ProjectDominant(n, m_kernel.Positions[m_kernel.T1[partner]]);
+            t[2] = Triangulator.ProjectDominant(n, m_kernel.Positions[m_kernel.T2[partner]]);
+            if (!MakeCcw(t)) return false;
+            var q = Triangulator.ProjectDominant(n, p);
+            return m_eps.AreaSign(t[0], t[1], q, 1) != Sign3.Below
+                && m_eps.AreaSign(t[1], t[2], q, 1) != Sign3.Below
+                && m_eps.AreaSign(t[2], t[0], q, 1) != Sign3.Below;
         }
 
         private IEnumerable<(int, int)> FragmentEdges(Fragment f)

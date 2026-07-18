@@ -157,14 +157,6 @@ namespace Aardvark.Geometry.Tests
         }
 
         [Test]
-        public void CoplanarFacesThrowNotImplemented()
-        {
-            var a = Box(Box3d.Unit);
-            var b = Box(new Box3d(new V3d(0.5, 0.5, 0.0), new V3d(1.5, 1.5, 1.0))); // shares z=0 and z=1 planes
-            Assert.Throws<NotImplementedException>(() => Csg.Union(a, b));
-        }
-
-        [Test]
         public void ResultsAreDeterministic()
         {
             var a = Box(Box3d.Unit);
