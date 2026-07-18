@@ -13,7 +13,7 @@ namespace Aardvark.Geometry
     /// </summary>
     internal sealed class Kernel
     {
-        public readonly Eps Eps;
+        public Eps Eps;
 
         // vertices
         public readonly List<V3d> Positions = new();
@@ -36,6 +36,14 @@ namespace Aardvark.Geometry
         public readonly Box3d[] Bounds = new Box3d[2];
 
         public Kernel(Eps eps) => Eps = eps;
+
+        /// <summary>Sets the scene reference scale on the tolerance model (call after all inputs are ingested).</summary>
+        public void UpdateSceneScale()
+        {
+            var maxMag = 0.0;
+            for (var i = 0; i < Positions.Count; i++) maxMag = maxMag.Max(Positions[i].NormMax);
+            Eps = Eps.WithScene(maxMag);
+        }
 
         public int TriangleCount => T0.Count;
 

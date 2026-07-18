@@ -58,7 +58,15 @@ The tol formula mirrors the floating-point error bound of evaluating `h` itself
 fp uncertainty scale together — this is what makes the model offset-invariant:
 at offset 1e7 the representable grid is coarser and tol grows with it.
 
-Vertex–vertex coincidence: `|a-b|∞ ≤ eps · (|a|∞ + |b|∞)`.
+All tolerances additionally include a **scene term** `eps · Scene` (Scene =
+max |coordinate| over all input vertices): a plane or point is only known to
+within the slop of the geometry that defined it, so tolerances must not
+collapse for points near the origin, where the local magnitude terms vanish
+(found by fuzzing: a vertex at the origin classified strictly Below a plane it
+was 1e-16 away from, because `eps·(|p|+|d|)` was ~1e-27 there). The scene term
+keeps every predicate exactly invariant under whole-scene transforms.
+
+Vertex–vertex coincidence: `|a-b|∞ ≤ eps · (|a|∞ + |b|∞ + Scene)`.
 2D orientation (ear clipping, in-plane booleans): `tol = eps · (m + L) · L` with
 m = max coordinate magnitude and L = max edge extent — the propagation of
 per-coordinate slop eps·m through the determinant; never eps·m², which would

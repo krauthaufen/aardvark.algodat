@@ -54,6 +54,7 @@ namespace Aardvark.Geometry
 
         public Pipeline(Kernel kernel)
         {
+            kernel.UpdateSceneScale();
             m_kernel = kernel;
             m_eps = kernel.Eps;
         }
@@ -421,6 +422,7 @@ namespace Aardvark.Geometry
                     continue;
                 }
 
+                m_diagTri = tri;
                 var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
                 V2d Proj(int vid) => Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[vid]);
 
@@ -430,23 +432,47 @@ namespace Aardvark.Geometry
                     m_kernel.T2[tri], Proj(m_kernel.T2[tri]));
 
                 if (boundary != null)
-                    foreach (var vid in boundary) cdt.InsertPoint(vid, Proj(vid));
+                    foreach (var vid in boundary)
+                    {
+                        try { cdt.InsertPoint(vid, Proj(vid)); }
+                        catch (CsgVerificationException e) { throw new CsgVerificationException(Diag(e, vid)); }
+                    }
                 if (constraints != null)
                 {
                     foreach (var (ca, cb) in constraints)
                     {
-                        cdt.InsertPoint(ca, Proj(ca));
-                        cdt.InsertPoint(cb, Proj(cb));
+                        try { cdt.InsertPoint(ca, Proj(ca)); cdt.InsertPoint(cb, Proj(cb)); }
+                        catch (CsgVerificationException e) { throw new CsgVerificationException(Diag(e, ca, cb)); }
                     }
                     foreach (var (ca, cb) in constraints) cdt.AddConstraint(ca, cb);
                 }
 
-                var (tris, constraintEdges) = cdt.Triangulate();
+                List<(int, int, int)> tris;
+                List<(int, int)> constraintEdges;
+                try
+                {
+                    (tris, constraintEdges) = cdt.Triangulate();
+                }
+                catch (CsgVerificationException e)
+                {
+                    throw new CsgVerificationException(Diag(e));
+                }
                 foreach (var (a, b, c) in tris) Fragments.Add(new Fragment(a, b, c, tri));
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
                 foreach (var (a, b) in constraintEdges) barrier.Add(SortedEdge(a, b));
             }
         }
+
+        private string Diag(Exception e, params int[] vids)
+        {
+            var tri = m_diagTri;
+            var s = $"{e.Message} [tri {tri} mesh {m_kernel.TriMesh[tri]} face {m_kernel.TriFace[tri]} " +
+                $"corners ({m_kernel.T0[tri]}:{m_kernel.Positions[m_kernel.T0[tri]]}, {m_kernel.T1[tri]}:{m_kernel.Positions[m_kernel.T1[tri]]}, {m_kernel.T2[tri]}:{m_kernel.Positions[m_kernel.T2[tri]]})";
+            foreach (var v in vids) s += $" point {v}:{m_kernel.Positions[v]} gen {m_kernel.Generation[v]}";
+            return s + "]";
+        }
+
+        private int m_diagTri;
 
         private List<int>? BoundaryPoints(int tri)
         {

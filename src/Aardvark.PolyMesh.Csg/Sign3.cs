@@ -32,15 +32,30 @@ namespace Aardvark.Geometry
         /// </summary>
         public readonly double Relative;
 
+        /// <summary>
+        /// Reference magnitude of the scene (max |coordinate| over all input
+        /// vertices). Every tolerance includes eps*Scene: a plane or point is
+        /// only known to within the slop of the geometry that defined it, so
+        /// tolerances must not collapse for points near the origin (where the
+        /// local magnitude terms vanish). Adding the scene term keeps all
+        /// predicates exactly invariant under whole-scene transforms.
+        /// </summary>
+        public readonly double Scene;
+
         /// <summary>Per-generation tolerance growth for derived points.</summary>
         public const double GenerationFactor = 8.0;
 
-        public Eps(double relative)
+        public Eps(double relative, double scene = 0.0)
         {
             if (!(relative > 0.0) || relative >= 1e-3)
                 throw new ArgumentOutOfRangeException(nameof(relative));
+            if (!(scene >= 0.0))
+                throw new ArgumentOutOfRangeException(nameof(scene));
             Relative = relative;
+            Scene = scene;
         }
+
+        public Eps WithScene(double scene) => new(Relative, scene);
 
         /// <summary>
         /// Classify point p against plane (unit normal n, distance d) with
@@ -53,7 +68,7 @@ namespace Aardvark.Geometry
         {
             var h = plane.Normal.Dot(p) - plane.Distance;
             var tol = Relative
-                * (p.X.Abs() + p.Y.Abs() + p.Z.Abs() + plane.Distance.Abs())
+                * (p.X.Abs() + p.Y.Abs() + p.Z.Abs() + plane.Distance.Abs() + Scene)
                 * Gen(generation);
             return h < -tol ? Sign3.Below : h > tol ? Sign3.Above : Sign3.On;
         }
@@ -61,7 +76,7 @@ namespace Aardvark.Geometry
         /// <summary>Coincidence test for two points (max-norm, relative).</summary>
         public bool AreCoincident(in V3d a, in V3d b, int generation = 0)
         {
-            var tol = Relative * (a.NormMax + b.NormMax) * Gen(generation);
+            var tol = Relative * (a.NormMax + b.NormMax + Scene) * Gen(generation);
             return (a - b).NormMax <= tol;
         }
 
@@ -81,7 +96,7 @@ namespace Aardvark.Geometry
             var m = Fun.Max(a.X.Abs(), a.Y.Abs(), b.X.Abs(), b.Y.Abs()).Max(
                     Fun.Max(c.X.Abs(), c.Y.Abs()));
             var l = Fun.Max(d1.X.Abs(), d1.Y.Abs(), d2.X.Abs(), d2.Y.Abs());
-            var tol = Relative * (m + l) * l * Gen(generation);
+            var tol = Relative * (m + l + Scene) * l * Gen(generation);
             return det < -tol ? Sign3.Below : det > tol ? Sign3.Above : Sign3.On;
         }
 

@@ -36,7 +36,7 @@ namespace Aardvark.Geometry
         {
             m_eps = eps;
             AddPointRaw(k0, p0); AddPointRaw(k1, p1); AddPointRaw(k2, p2);
-            if (m_eps.AreaSign(p0, p1, p2) != Sign3.Above)
+            if (Area(p0, p1, p2) != Sign3.Above)
                 throw new CsgVerificationException("face is not counter-clockwise in its plane projection");
             AddTri(0, 1, 2);
         }
@@ -54,6 +54,14 @@ namespace Aardvark.Geometry
 
         private (int V0, int V1, int V2) Tri(int t) => (m_t0[t], m_t1[t], m_t2[t]);
 
+        /// <summary>
+        /// All CDT predicates run at generation-1 tolerance: cut points carry
+        /// one generation of derived error, and mixing tolerances between the
+        /// pipeline (which classifies cuts at generation 1) and the CDT would
+        /// let a point count as on-edge in one and outside in the other.
+        /// </summary>
+        private Sign3 Area(in V2d a, in V2d b, in V2d c) => m_eps.AreaSign(a, b, c, 1);
+
         private static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
 
         /// <summary>Inserts a point; returns its local id (an existing one if the point coincides with an existing vertex).</summary>
@@ -65,9 +73,9 @@ namespace Aardvark.Geometry
             {
                 if (m_dead[t]) continue;
                 var (a, b, c) = Tri(t);
-                var s0 = m_eps.AreaSign(m_pos[a], m_pos[b], p);
-                var s1 = m_eps.AreaSign(m_pos[b], m_pos[c], p);
-                var s2 = m_eps.AreaSign(m_pos[c], m_pos[a], p);
+                var s0 = Area(m_pos[a], m_pos[b], p);
+                var s1 = Area(m_pos[b], m_pos[c], p);
+                var s2 = Area(m_pos[c], m_pos[a], p);
                 if (s0 == Sign3.Below || s1 == Sign3.Below || s2 == Sign3.Below) continue;
 
                 var onCount = (s0 == Sign3.On ? 1 : 0) + (s1 == Sign3.On ? 1 : 0) + (s2 == Sign3.On ? 1 : 0);
@@ -168,8 +176,8 @@ namespace Aardvark.Geometry
                 var x = ThirdVertex(nt, u, v);
                 if (InCircle(m_pos[u], m_pos[v], m_pos[w], m_pos[x]) <= 0) continue;
                 // flip only if the resulting triangles are strictly CCW
-                if (m_eps.AreaSign(m_pos[u], m_pos[x], m_pos[w]) != Sign3.Above) continue;
-                if (m_eps.AreaSign(m_pos[x], m_pos[v], m_pos[w]) != Sign3.Above) continue;
+                if (Area(m_pos[u], m_pos[x], m_pos[w]) != Sign3.Above) continue;
+                if (Area(m_pos[x], m_pos[v], m_pos[w]) != Sign3.Above) continue;
                 m_dead[t] = true; m_dead[nt] = true;
                 AddTri(u, x, w); AddTri(x, v, w);
                 pending.Push((u, x)); pending.Push((x, v));
@@ -186,8 +194,41 @@ namespace Aardvark.Geometry
 
         private void EnforceConstraint(int a, int b)
         {
+            // split at through-vertices first: points lying On the segment
+            // strictly between its endpoints partition it into sub-segments
+            var pa = m_pos[a]; var pb = m_pos[b];
+            var d = pb - pa;
+            var len2 = d.LengthSquared;
+            var through = new List<(double T, int V)>();
+            for (var v = 0; v < m_pos.Count; v++)
+            {
+                if (v == a || v == b) continue;
+                if (Area(pa, pb, m_pos[v]) != Sign3.On) continue;
+                var t = d.Dot(m_pos[v] - pa);
+                if (t <= 0 || t >= len2) continue;
+                through.Add((t, v));
+            }
+            through.Sort((x, y) => x.T.CompareTo(y.T));
+
+            var prev = a;
+            foreach (var (_, v) in through)
+            {
+                EnforceSegment(prev, v);
+                prev = v;
+            }
+            EnforceSegment(prev, b);
+        }
+
+        /// <summary>
+        /// Makes edge (a,b) present by flipping crossing edges (Sloan-style
+        /// constraint recovery); assumes no vertex lies On the open segment.
+        /// </summary>
+        private void EnforceSegment(int a, int b)
+        {
+            if (a == b) return;
+            var pa = m_pos[a]; var pb = m_pos[b];
             var guard = 0;
-            while (a != b && guard++ < 1000)
+            while (guard++ < 10000)
             {
                 if (FindTriWithEdge(a, b) >= 0 || FindTriWithEdge(b, a) >= 0)
                 {
@@ -195,108 +236,44 @@ namespace Aardvark.Geometry
                     return;
                 }
 
-                // find the through-vertex or the first crossed edge in the fan around a
-                var pa = m_pos[a]; var pb = m_pos[b];
-                var found = false;
-                for (var t = 0; t < m_t0.Count && !found; t++)
+                var flipped = false;
+                for (var t = 0; t < m_t0.Count && !flipped; t++)
                 {
                     if (m_dead[t]) continue;
-                    var (u, v, w) = Tri(t);
-                    int p, q;
-                    if (u == a) { p = v; q = w; }
-                    else if (v == a) { p = w; q = u; }
-                    else if (w == a) { p = u; q = v; }
-                    else continue;
-
-                    // through-vertex: p (or q) lies On segment a-b, strictly between
-                    foreach (var m in new[] { p, q })
+                    var (t0, t1, t2) = Tri(t);
+                    Span<int> e = stackalloc int[] { t0, t1, t1, t2, t2, t0 };
+                    for (var i = 0; i < 3 && !flipped; i++)
                     {
-                        if (m_eps.AreaSign(pa, pb, m_pos[m]) != Sign3.On) continue;
-                        var d = pb - pa; var e = m_pos[m] - pa;
-                        var dot = d.Dot(e);
-                        if (dot <= 0 || dot >= d.LengthSquared) continue;
-                        m_constrained.Add(Key(a, m));
-                        a = m; found = true;
-                        break;
-                    }
-                    if (found) break;
+                        var u = e[i * 2]; var v = e[i * 2 + 1];
+                        if (u == a || u == b || v == a || v == b) continue;
+                        // does edge (u,v) cross the open segment a-b?
+                        var su = Area(pa, pb, m_pos[u]);
+                        var sv = Area(pa, pb, m_pos[v]);
+                        if (!((su == Sign3.Above && sv == Sign3.Below) || (su == Sign3.Below && sv == Sign3.Above))) continue;
+                        var sa2 = Area(m_pos[u], m_pos[v], pa);
+                        var sb2 = Area(m_pos[u], m_pos[v], pb);
+                        if (!((sa2 == Sign3.Above && sb2 == Sign3.Below) || (sa2 == Sign3.Below && sb2 == Sign3.Above))) continue;
+                        if (m_constrained.Contains(Key(u, v)))
+                            throw new CsgVerificationException("constraint segments cross each other in a face");
 
-                    // crossed edge: p strictly left, q strictly right of a->b
-                    if (m_eps.AreaSign(pa, pb, m_pos[p]) == Sign3.Above &&
-                        m_eps.AreaSign(pa, pb, m_pos[q]) == Sign3.Below)
-                    {
-                        CarveCavity(ref a, b, t, p, q);
-                        found = true;
+                        var ft = FindTriWithEdge(u, v);
+                        var nt = FindTriWithEdge(v, u);
+                        if (ft < 0 || nt < 0)
+                            throw new CsgVerificationException("constraint crossing edge has no twin (left the face)");
+                        var w = ThirdVertex(ft, u, v);
+                        var x = ThirdVertex(nt, u, v);
+                        // flip only when the quad is strictly convex
+                        if (Area(m_pos[u], m_pos[x], m_pos[w]) != Sign3.Above) continue;
+                        if (Area(m_pos[x], m_pos[v], m_pos[w]) != Sign3.Above) continue;
+                        m_dead[ft] = true; m_dead[nt] = true;
+                        AddTri(u, x, w); AddTri(x, v, w);
+                        flipped = true;
                     }
                 }
-                if (!found)
+                if (!flipped)
                     throw new CsgVerificationException("constraint segment could not be recovered in face triangulation");
             }
-            if (guard >= 1000)
-                throw new CsgVerificationException("constraint enforcement did not converge");
-        }
-
-        /// <summary>
-        /// Marches from a towards b starting at triangle t entered between p
-        /// (left) and q (right), removes crossed triangles and retriangulates
-        /// the two cavity sides. May stop early at a through-vertex, in which
-        /// case a is advanced to it.
-        /// </summary>
-        private void CarveCavity(ref int a, int b, int t, int p, int q)
-        {
-            var pa = m_pos[a]; var pb = m_pos[b];
-            var left = new List<int> { p };
-            var right = new List<int> { q };
-            var dead = new List<int> { t };
-            var end = b;
-
-            var guard = 0;
-            while (guard++ < 1000)
-            {
-                var nt = FindTriWithEdge(right[^1], left[^1]);
-                if (nt < 0) throw new CsgVerificationException("constraint march left the triangulation");
-                dead.Add(nt);
-                var r = ThirdVertex(nt, left[^1], right[^1]);
-                if (r == b) break;
-                var s = m_eps.AreaSign(pa, pb, m_pos[r]);
-                if (s == Sign3.On)
-                {
-                    var d = pb - pa; var e = m_pos[r] - pa;
-                    if (d.Dot(e) > 0 && d.Dot(e) < d.LengthSquared) { end = r; break; }
-                    throw new CsgVerificationException("constraint march hit a vertex outside the segment");
-                }
-                if (s == Sign3.Above) left.Add(r); else right.Add(r);
-            }
-            if (guard >= 1000) throw new CsgVerificationException("constraint march did not converge");
-
-            foreach (var d in dead) m_dead[d] = true;
-            TriangulateCavity(a, end, left, true);
-            TriangulateCavity(a, end, right, false);
-            m_constrained.Add(Key(a, end));
-            a = end;
-        }
-
-        /// <summary>
-        /// Retriangulates one side of a carved cavity (polyline of points
-        /// between a and b, in march order) using the recursive Delaunay
-        /// cavity algorithm.
-        /// </summary>
-        private void TriangulateCavity(int a, int b, List<int> chain, bool leftSide)
-        {
-            if (chain.Count == 0) return;
-            var best = 0;
-            for (var i = 1; i < chain.Count; i++)
-            {
-                if (InCircle(m_pos[a], m_pos[b], m_pos[chain[best]], m_pos[chain[i]]) > 0) best = i;
-            }
-            var c = chain[best];
-            // left side: c lies left of a->b, CCW triangle is (a, b, c) reversed -> (a, c, b)? decide by orientation
-            if (m_eps.AreaSign(m_pos[a], m_pos[c], m_pos[b]) == Sign3.Above) AddTri(a, c, b);
-            else if (m_eps.AreaSign(m_pos[a], m_pos[b], m_pos[c]) == Sign3.Above) AddTri(a, b, c);
-            // degenerate (collinear) cavity triangle: skip emission, chain splits still recurse
-
-            TriangulateCavity(a, c, chain.GetRange(0, best), leftSide);
-            TriangulateCavity(c, b, chain.GetRange(best + 1, chain.Count - best - 1), leftSide);
+            throw new CsgVerificationException("constraint enforcement did not converge");
         }
 
         /// <summary>
