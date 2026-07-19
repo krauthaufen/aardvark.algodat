@@ -73,11 +73,15 @@ namespace Aardvark.Geometry
         private CsgBvh[] m_bvh = Array.Empty<CsgBvh>();
         private int[][] m_triOf = Array.Empty<int[]>();
 
-        public Pipeline(Kernel kernel)
+        /// <summary>optional pre-built solids providing cached BVHs (index-aligned with meshes; entries may be null)</summary>
+        private readonly CsgMesh?[] m_prepared;
+
+        public Pipeline(Kernel kernel, CsgMesh?[]? prepared = null)
         {
             kernel.UpdateSceneScale();
             m_kernel = kernel;
             m_eps = kernel.Eps;
+            m_prepared = prepared ?? new CsgMesh?[kernel.MeshCount];
             m_barriers = new HashSet<long>[kernel.MeshCount]
                 .SetByIndex(_ => new HashSet<long>(MixedLongComparer.Instance));
         }
@@ -150,14 +154,20 @@ namespace Aardvark.Geometry
 
             Canon = new int[n].SetByIndex(i => Find(i));
 
-            // reject same-mesh welds: features below tolerance in one input
+            // reject same-mesh welds (features below tolerance) for user
+            // input; trusted prepared solids may legitimately contain
+            // geometrically coincident vertices (pinched self-touching results
+            // of earlier operations) — those weld back together
             for (var i = 0; i < n; i++)
             {
                 var r = Canon[i];
-                if (r != i && m_kernel.VertexSourceMesh(r) == m_kernel.VertexSourceMesh(i))
-                    throw new CsgInputException(
-                        $"input mesh {(m_kernel.VertexSourceMesh(i) == 0 ? "A" : "B")} contains distinct vertices closer than tolerance " +
-                        $"(vertices {i - m_kernel.VertexOffset[m_kernel.VertexSourceMesh(i)]} and {r - m_kernel.VertexOffset[m_kernel.VertexSourceMesh(r)]})");
+                if (r == i) continue;
+                var mesh = m_kernel.VertexSourceMesh(i);
+                if (mesh != m_kernel.VertexSourceMesh(r)) continue;
+                if (mesh >= 0 && m_prepared[mesh] != null) continue;
+                throw new CsgInputException(
+                    $"input mesh {mesh} contains distinct vertices closer than tolerance " +
+                    $"(vertices {i - m_kernel.VertexOffset[mesh]} and {r - m_kernel.VertexOffset[mesh]})");
             }
 
             for (var t = 0; t < m_kernel.TriangleCount; t++)
@@ -231,6 +241,14 @@ namespace Aardvark.Geometry
                 for (var t = 0; t < m_kernel.TriangleCount; t++)
                     if (m_kernel.TriMesh[t] == m) list.Add(t);
                 m_triOf[m] = list.ToArray();
+                if (m_prepared[m] != null)
+                {
+                    // cached BVH from the prepared solid; its slack policy
+                    // covers eps-welding position shifts, the guard rebuilds
+                    // when the scene demands more
+                    m_bvh[m] = m_prepared[m]!.Bvh(2 * slackScene);
+                    continue;
+                }
                 var boxes = new Box3d[list.Count];
                 for (var i = 0; i < list.Count; i++)
                 {

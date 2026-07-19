@@ -193,6 +193,33 @@ namespace Aardvark.Geometry.Tests
 
         [Test]
         [Explicit]
+        public void BenchExport()
+        {
+            // export sphere pairs and time our union on them (after warmup)
+            var cases = new System.Collections.Generic.List<object>();
+            foreach (var sub in new[] { 4, 5, 6 })
+            {
+                var a = CsgM5Tests.Icosphere(V3d.Zero, 1.0, sub);
+                var b = CsgM5Tests.Icosphere(new V3d(0.8, 0.3, 0.2), 1.0, sub);
+                Csg.Union(a, b); // warmup / JIT
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var u = Csg.Union(a, b);
+                sw.Stop();
+                Console.WriteLine($"BENCH ours sphere-{sub} ({(a.FirstIndexArray.Length - 1) * 2} tris): {sw.Elapsed.TotalMilliseconds:0.0} ms");
+                object Mesh(PolyMesh m) => new
+                {
+                    vertices = m.PositionArray.SelectMany(p => new[] { p.X, p.Y, p.Z }).ToArray(),
+                    triangles = m.VertexIndexArray,
+                };
+                cases.Add(new { name = $"sphere-{sub}", a = Mesh(a), b = Mesh(b) });
+            }
+            System.IO.File.WriteAllText("/tmp/csgbench.json",
+                System.Text.Json.JsonSerializer.Serialize(new { cases }));
+            Console.WriteLine("BENCH exported /tmp/csgbench.json");
+        }
+
+        [Test]
+        [Explicit]
         public void PerfStages()
         {
             Environment.SetEnvironmentVariable("CSG_PERF", "1");

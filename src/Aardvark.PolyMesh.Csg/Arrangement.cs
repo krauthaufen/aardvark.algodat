@@ -62,6 +62,39 @@ namespace Aardvark.Geometry
             return new CsgArrangement(kernel, pipeline, solids, o);
         }
 
+        public static CsgArrangement Arrange(CsgMesh a, CsgMesh b, CsgOptions? options = null)
+            => Arrange(new[] { a, b }, options);
+
+        /// <summary>
+        /// Arranges N prepared solids: no re-verification, no re-triangulation,
+        /// planes carried through, cached BVHs reused.
+        /// </summary>
+        public static CsgArrangement Arrange(CsgMesh[] solids, CsgOptions? options = null)
+        {
+            if (solids.Length < 2) throw new ArgumentException("need at least two solids");
+            var o = options ?? CsgOptions.Default;
+            var kernel = new Kernel(new Eps(o.RelativeEpsilon));
+            for (var i = 0; i < solids.Length; i++) kernel.IngestPrepared(solids[i], i);
+            var pipeline = new Pipeline(kernel, solids);
+            pipeline.Run();
+            return new CsgArrangement(kernel, pipeline, solids.Map(s => s.Source), o);
+        }
+
+        /// <summary>Union as prepared solids (one per component).</summary>
+        public CsgMesh[] UnionSolids() => EmitSolids(Union);
+        /// <summary>Intersection as prepared solids (one per component).</summary>
+        public CsgMesh[] IntersectionSolids() => EmitSolids(Intersection);
+        /// <summary>Difference (solid 0 minus the rest) as prepared solids.</summary>
+        public CsgMesh[] DifferenceSolids() => EmitSolids(Difference);
+
+        private CsgMesh[] m_lastSolids = Array.Empty<CsgMesh>();
+
+        private CsgMesh[] EmitSolids(Func<PolyMesh[]> op)
+        {
+            op(); // Emitter records CsgMesh results alongside the PolyMeshes
+            return m_lastSolids;
+        }
+
         // Coincident (coplanar) surface regions exist once in each covering
         // solid; selections keep the copy of the lowest-indexed solid so the
         // region is emitted exactly once.
@@ -142,10 +175,15 @@ namespace Aardvark.Geometry
         /// merged surface would be non-manifold — separate solids keep the
         /// manifold guarantee.
         /// </summary>
-        public PolyMesh[] Xor()
+        public PolyMesh[] Xor() => XorSolids().Map(s => s.ToPolyMesh());
+
+        /// <summary>Symmetric difference as prepared solids (both lobes' components).</summary>
+        public CsgMesh[] XorSolids()
         {
             if (SolidCount != 2) throw new NotSupportedException("Xor is defined for two solids");
-            return Difference().Concat(Emit((mi, f) =>
+            Difference();
+            var first = m_lastSolids;
+            Emit((mi, f) =>
             {
                 if (mi == 1)
                     return m_pipeline.Label(f, 0) switch
@@ -154,7 +192,8 @@ namespace Aardvark.Geometry
                         _ => Selection.Drop,
                     };
                 return m_pipeline.Label(f, 1) == FragLabel.Inside ? Selection.Flip : Selection.Drop;
-            })).ToArray();
+            });
+            return first.Concat(m_lastSolids).ToArray();
         }
 
         private enum Selection { Drop, Keep, Flip }
@@ -174,7 +213,9 @@ namespace Aardvark.Geometry
                     default: throw new InvalidOperationException();
                 }
             }
-            return Emitter.Emit(m_kernel, tris, m_sources, m_options.Verification == CsgVerification.Full);
+            var solids = Emitter.Emit(m_kernel, tris, m_sources, m_options.Verification == CsgVerification.Full);
+            m_lastSolids = solids;
+            return solids.Map(s => s.ToPolyMesh());
         }
     }
 
@@ -194,9 +235,9 @@ namespace Aardvark.Geometry
     /// </summary>
     internal static class Emitter
     {
-        public static PolyMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
+        public static CsgMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
         {
-            if (tris.Count == 0) return Array.Empty<PolyMesh>();
+            if (tris.Count == 0) return Array.Empty<CsgMesh>();
             var sw = Environment.GetEnvironmentVariable("CSG_PERF") != null
                 ? System.Diagnostics.Stopwatch.StartNew() : null;
 
@@ -255,13 +296,13 @@ namespace Aardvark.Geometry
             }
 
             if (sw != null) { Console.WriteLine($"PERF emit-pairing: {sw.Elapsed.TotalMilliseconds:0.0} ms"); sw.Restart(); }
-            var result = new PolyMesh[componentCount];
+            var result = new CsgMesh[componentCount];
             for (var ci = 0; ci < componentCount; ci++)
             {
                 var componentTris = new List<int>();
                 for (var i = 0; i < tris.Count; i++)
                     if (componentOfFace[i] == ci) componentTris.Add(i);
-                result[ci] = BuildPolyMesh(k, tris, componentTris, Find, sources, verify);
+                result[ci] = BuildSolid(k, tris, componentTris, Find, sources, verify);
             }
             if (sw != null) Console.WriteLine($"PERF emit-build+verify ({tris.Count} tris): {sw.Elapsed.TotalMilliseconds:0.0} ms");
             return result;
@@ -344,7 +385,7 @@ namespace Aardvark.Geometry
             return pair;
         }
 
-        private static PolyMesh BuildPolyMesh(
+        private static CsgMesh BuildSolid(
             Kernel k, List<EmitTri> allTris, List<int> triIndices, Func<int, int> cornerGroupOf,
             PolyMesh[] sources, bool verify)
         {
@@ -423,7 +464,29 @@ namespace Aardvark.Geometry
                     throw new CsgVerificationException($"output verification failed: {violation}");
             }
             Lap("verify");
-            return mesh;
+
+            // kernel form of the result: per-tri parent planes (ground truth
+            // carried through chains), sequential face ids, identity slots
+            var outT0 = new int[triCount]; var outT1 = new int[triCount]; var outT2 = new int[triCount];
+            var outPlanes = new Plane3d[triCount];
+            var outTriPlane = new int[triCount]; var outTriFace = new int[triCount];
+            var outC0 = new int[triCount]; var outC1 = new int[triCount]; var outC2 = new int[triCount];
+            for (var i = 0; i < triCount; i++)
+            {
+                outT0[i] = via[i * 3]; outT1[i] = via[i * 3 + 1]; outT2[i] = via[i * 3 + 2];
+                var plane = k.Planes[k.TriPlane[tris[i].Parent]];
+                // flipped fragments (difference walls) carry the negated plane:
+                // plane orientation must match the output winding
+                var wind = (positions[outT1[i]] - positions[outT0[i]])
+                    .Cross(positions[outT2[i]] - positions[outT0[i]]);
+                if (wind.Dot(plane.Normal) < 0) plane = new Plane3d(-plane.Normal, -plane.Distance);
+                outPlanes[i] = plane;
+                outTriPlane[i] = i;
+                outTriFace[i] = i;
+                outC0[i] = i * 3; outC1[i] = i * 3 + 1; outC2[i] = i * 3 + 2;
+            }
+            return new CsgMesh(mesh, outT0, outT1, outT2, outPlanes, outTriPlane, outTriFace, outC0, outC1, outC2,
+                spatiallyOrdered: true);
         }
 
         /// <summary>Barycentric coordinates of p in the parent triangle, computed in the parent plane's 2D projection.</summary>

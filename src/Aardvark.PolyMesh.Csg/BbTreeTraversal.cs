@@ -31,23 +31,32 @@ namespace Aardvark.Geometry
         private readonly Box3d m_rootBox;
         private int m_nodeCount;
 
-        public CsgBvh(Box3d[] leafBoxes)
+        /// <summary>
+        /// presorted: skip the Morton sort and median-split over the given
+        /// order directly — for boxes that are already spatially coherent
+        /// (e.g. boolean results, whose triangles are emitted grouped by
+        /// parent face in source order), this makes the build O(n).
+        /// </summary>
+        public CsgBvh(Box3d[] leafBoxes, bool presorted = false)
         {
             Count = leafBoxes.Length;
             Leaves = leafBoxes;
             if (Count == 0) { m_rootBox = Box3d.Invalid; m_root = 0; return; }
             if (Count == 1) { m_rootBox = leafBoxes[0]; m_root = -1; return; }
 
-            var bounds = new Box3d(leafBoxes);
             var order = new int[Count].SetByIndex(i => i);
-            var keys = new uint[Count];
-            var scale = new V3d(1023.0, 1023.0, 1023.0) / (bounds.Size + new V3d(1e-300));
-            for (var i = 0; i < Count; i++)
+            if (!presorted)
             {
-                var c = (leafBoxes[i].Center - bounds.Min) * scale;
-                keys[i] = Morton((uint)c.X.Clamp(0, 1023), (uint)c.Y.Clamp(0, 1023), (uint)c.Z.Clamp(0, 1023));
+                var bounds = new Box3d(leafBoxes);
+                var keys = new uint[Count];
+                var scale = new V3d(1023.0, 1023.0, 1023.0) / (bounds.Size + new V3d(1e-300));
+                for (var i = 0; i < Count; i++)
+                {
+                    var c = (leafBoxes[i].Center - bounds.Min) * scale;
+                    keys[i] = Morton((uint)c.X.Clamp(0, 1023), (uint)c.Y.Clamp(0, 1023), (uint)c.Z.Clamp(0, 1023));
+                }
+                Array.Sort(keys, order);
             }
-            Array.Sort(keys, order);
 
             m_left = new int[Count - 1];
             m_right = new int[Count - 1];

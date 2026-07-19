@@ -66,5 +66,28 @@ namespace Aardvark.Geometry
             => subtrahends.Length == 0
                 ? new[] { a }
                 : CsgArrangement.Arrange(new[] { a }.Concat(subtrahends).ToArray(), options).Difference();
+
+        // prepared-solid (CsgMesh) forms: no re-verification/triangulation,
+        // cached BVHs and ground-truth planes reused; results are prepared again
+
+        public static CsgMesh[] Union(CsgMesh a, CsgMesh b, CsgOptions? options = null)
+            => CsgArrangement.Arrange(a, b, options).UnionSolids();
+
+        public static CsgMesh[] Intersection(CsgMesh a, CsgMesh b, CsgOptions? options = null)
+            => CsgArrangement.Arrange(a, b, options).IntersectionSolids();
+
+        public static CsgMesh[] Difference(CsgMesh a, CsgMesh b, CsgOptions? options = null)
+            => CsgArrangement.Arrange(a, b, options).DifferenceSolids();
+
+        public static CsgMesh[] Union(CsgMesh[] solids, CsgOptions? options = null)
+            => solids.Length == 1 ? solids : CsgArrangement.Arrange(solids, options).UnionSolids();
+
+        public static CsgMesh[] Intersection(CsgMesh[] solids, CsgOptions? options = null)
+            => solids.Length == 1 ? solids : CsgArrangement.Arrange(solids, options).IntersectionSolids();
+
+        public static CsgMesh[] Difference(CsgMesh a, CsgMesh[] subtrahends, CsgOptions? options = null)
+            => subtrahends.Length == 0
+                ? new[] { a }
+                : CsgArrangement.Arrange(new[] { a }.Concat(subtrahends).ToArray(), options).DifferenceSolids();
     }
 }

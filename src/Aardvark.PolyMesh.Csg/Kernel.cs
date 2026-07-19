@@ -142,6 +142,61 @@ namespace Aardvark.Geometry
             }
         }
 
+        /// <summary>
+        /// Appends an already verified/triangulated solid (no verification, no
+        /// ear clipping, planes copied — ground truth preserved across chains).
+        /// </summary>
+        public void IngestPrepared(CsgMesh solid, int meshIndex)
+        {
+            if (meshIndex != MeshCount)
+                throw new ArgumentException($"meshes must be ingested in order (got index {meshIndex}, expected {MeshCount})");
+            if (meshIndex > 255)
+                throw new NotSupportedException("at most 256 solids per arrangement");
+            var pos = solid.Source.PositionArray;
+            var vertexOffset = Positions.Count;
+            VertexOffset.Add(vertexOffset);
+            VertexCount.Add(pos.Length);
+            if (solid.HasTrafo)
+            {
+                // materialize the lazy transformation while copying
+                var bounds = Box3d.Invalid;
+                var maxMag = 0.0;
+                for (var i = 0; i < pos.Length; i++)
+                {
+                    var p = solid.Trafo.Forward.TransformPos(pos[i]);
+                    Positions.Add(p);
+                    Generation.Add(0);
+                    VertexMesh.Add(meshIndex);
+                    bounds.ExtendBy(p);
+                    maxMag = maxMag.Max(p.NormMax);
+                }
+                Bounds.Add(bounds);
+                Eps = Eps.WithScene(Eps.Scene.Max(maxMag));
+            }
+            else
+            {
+                for (var i = 0; i < pos.Length; i++)
+                {
+                    Positions.Add(pos[i]);
+                    Generation.Add(0);
+                    VertexMesh.Add(meshIndex);
+                }
+                Bounds.Add(solid.Bounds3d);
+                Eps = Eps.WithScene(Eps.Scene.Max(solid.MeshMag));
+            }
+
+            var planeOffset = Planes.Count;
+            foreach (var p in solid.Planes)
+                Planes.Add(solid.HasTrafo ? solid.TransformPlane(p) : p);
+            for (var t = 0; t < solid.T0.Length; t++)
+            {
+                AddTriangle(
+                    vertexOffset + solid.T0[t], vertexOffset + solid.T1[t], vertexOffset + solid.T2[t],
+                    planeOffset + solid.TriPlane[t], meshIndex, solid.TriFace[t],
+                    solid.C0[t], solid.C1[t], solid.C2[t]);
+            }
+        }
+
         private void AddTriangle(int v0, int v1, int v2, int plane, int meshIndex, int face, int c0, int c1, int c2)
         {
             T0.Add(v0); T1.Add(v1); T2.Add(v2);
