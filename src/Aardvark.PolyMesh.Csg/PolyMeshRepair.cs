@@ -49,9 +49,10 @@ namespace Aardvark.Geometry
         /// <summary>
         /// Full sanitize: topological <see cref="Repair"/> followed by
         /// geometric self-intersection resolution (the union of everything the
-        /// surface encloses). If resolution hits a degeneracy it cannot yet
-        /// handle (coincident coplanar self-overlap), the topologically-clean
-        /// repair is returned instead, so the result is always valid manifolds.
+        /// surface encloses, transversal and coplanar-coincident overlaps
+        /// alike). Should resolution still hit a degeneracy, the
+        /// topologically-clean repair is returned instead, so the result is
+        /// always valid manifolds.
         /// </summary>
         public static PolyMesh[] Sanitize(PolyMesh mesh, RepairOptions? options = null)
         {

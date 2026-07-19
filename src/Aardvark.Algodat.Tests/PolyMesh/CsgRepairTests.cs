@@ -218,6 +218,47 @@ namespace Aardvark.Geometry.Tests
         }
 
         [Test]
+        public void ResolvesCoplanarOverlap()
+        {
+            // two boxes sharing face planes (y and z faces coincide) — the
+            // coincident-coplanar case. Union = 1 + 1 - 0.5.
+            var b1 = new Box3d(new V3d(0.5, 0, 0), new V3d(1.5, 1, 1));
+            var soup = Combine(BoxTris(Box3d.Unit), BoxTris(b1));
+            var resolved = Csg.ResolveSelfIntersections(soup);
+            foreach (var m in resolved) AssertManifold(m);
+            Assert.That(resolved.Sum(CsgM0Tests.Volume), Is.EqualTo(1.5).Within(1e-9));
+        }
+
+        [Test]
+        public void ResolvesFullyCoincidentDuplicate()
+        {
+            // the entire box duplicated (every face coincident) — must collapse
+            // back to one box, not double or vanish
+            var soup = Combine(BoxTris(Box3d.Unit), BoxTris(Box3d.Unit));
+            var resolved = Csg.ResolveSelfIntersections(soup);
+            foreach (var m in resolved) AssertManifold(m);
+            Assert.That(resolved.Sum(CsgM0Tests.Volume), Is.EqualTo(1.0).Within(1e-9));
+        }
+
+        [Test]
+        public void ResolvesBoxesOnSharedGroundPlane()
+        {
+            // the classic CAD case: several overlapping boxes all resting on
+            // z=0, so every bottom face is coplanar-coincident
+            var boxes = new[]
+            {
+                Box3d.Unit,
+                new Box3d(new V3d(0.5, 0.3, 0), new V3d(1.5, 1.3, 0.8)),
+                new Box3d(new V3d(0.2, 0.6, 0), new V3d(0.9, 1.6, 1.2)),
+            };
+            var soup = Combine(boxes.Select(BoxTris).ToArray());
+            var resolved = Csg.ResolveSelfIntersections(soup);
+            foreach (var m in resolved) AssertManifold(m);
+            var truth = Csg.Union(boxes.Select(CsgM0Tests.QuadBox).ToArray()).Sum(CsgM0Tests.Volume);
+            Assert.That(resolved.Sum(CsgM0Tests.Volume), Is.EqualTo(truth).Within(1e-7));
+        }
+
+        [Test]
         public void ResolvesThreeWayOverlap()
         {
             // three transversally-overlapping boxes (no two share a face plane)

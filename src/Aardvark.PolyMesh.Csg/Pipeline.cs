@@ -1801,39 +1801,76 @@ namespace Aardvark.Geometry
             SelfKeep = new bool[Fragments.Count];
             SelfFlip = new bool[Fragments.Count];
             var diag = m_bvh[0].RootBox.Size.Length;
+
             CsgParallel.For(0, Fragments.Count, m_maxThreads, f =>
             {
                 var fr = Fragments[f];
                 var p0 = m_kernel.Positions[fr.V0]; var p1 = m_kernel.Positions[fr.V1]; var p2 = m_kernel.Positions[fr.V2];
                 var c = (p0 + p1 + p2) / 3.0;
+
+                // coincident coplanar sheets: several faces overlap this exact
+                // location and would each contribute a boundary triangle, but
+                // they are subdivided independently (mismatched triangulations
+                // never cancel as exact-triple duplicates). Keep only the
+                // sheet from the LOWEST parent triangle — its fragments tile the
+                // region consistently — and drop the rest; the survivor's
+                // winding decision (same location) covers them all.
+                var partners = m_coplanar.GetOrDefault(fr.Parent);
+                if (partners != null)
+                {
+                    var ff = Fun.Max(m_kernel.TolFactor[fr.V0], m_kernel.TolFactor[fr.V1], m_kernel.TolFactor[fr.V2])
+                        .Max(Eps.GenerationFactor);
+                    foreach (var (partner, _, slab) in partners)
+                    {
+                        if (partner >= fr.Parent) continue; // only defer to a lower-index sheet
+                        var pf = Fun.Max(slab, ff)
+                            .Max(m_kernel.TolFactor[m_kernel.T0[partner]])
+                            .Max(m_kernel.TolFactor[m_kernel.T1[partner]])
+                            .Max(m_kernel.TolFactor[m_kernel.T2[partner]]);
+                        if (CoplanarCovers(partner, c, pf)) return; // duplicate sheet → drop
+                    }
+                }
+
                 var nrm = (p1 - p0).Cross(p2 - p0);
                 var len = nrm.Length;
-                if (len <= 0) return; // degenerate fragment
+                if (len <= 0) return; // degenerate
                 nrm /= len;
                 var edge = Fun.Min((p1 - p0).Length, (p2 - p1).Length, (p0 - p2).Length);
-                // sample winding on both sides; the correct offset lands one in
-                // each adjacent cell, so the windings must differ by exactly 1
-                // (crossing one sheet). At crowded triple lines a too-large
-                // offset crosses an extra sheet — shrink until the invariant
-                // holds; a too-small offset stays in one cell (diff 0) — grow.
-                var wMinus = 0; var wPlus = 0; var ok = false;
-                var eps = (1e-2 * edge).Max(1e-9 * diag);
-                for (var attempt = 0; attempt < 20 && eps > 1e-13 * diag; attempt++)
-                {
-                    var wm = WindingAt(c - eps * nrm);
-                    var wp = WindingAt(c + eps * nrm);
-                    if (wm == null || wp == null) { eps *= 0.5; continue; }
-                    var d = wm.Value - wp.Value;
-                    if (d == 1 || d == -1) { wMinus = wm.Value; wPlus = wp.Value; ok = true; break; }
-                    eps *= d == 0 ? 4.0 : 0.5;
-                }
-                if (!ok) return; // could not isolate the two adjacent cells → drop
-                var inMinus = wMinus >= 1;
-                var inPlus = wPlus >= 1;
-                if (inMinus == inPlus) return; // interior or exterior fragment → not on the boundary
+
+                // winding of the two cells bordering this fragment (its whole
+                // coincident stack sits at one location, so any offset clears
+                // it; stability under shrinking ε keeps us short of a
+                // NON-coincident neighbour)
+                var wBelow = StableWinding(c, -nrm, edge, diag);
+                var wAbove = StableWinding(c, nrm, edge, diag);
+                if (wBelow == null || wAbove == null) return;
+                var below = wBelow.Value >= 1; var above = wAbove.Value >= 1;
+                if (below == above) return; // interior or exterior → no boundary face here
+
+                var outward = above ? -nrm : nrm; // point out of the solid
                 SelfKeep[f] = true;
-                SelfFlip[f] = inPlus; // normal points into the solid → reverse it outward
+                SelfFlip[f] = nrm.Dot(outward) < 0;
             });
+        }
+
+        /// <summary>
+        /// Winding at c offset along dir, with the offset shrunk until the
+        /// value is stable (two successive offsets agree) — so an initial
+        /// offset that overshoots into a farther cell is corrected. Returns
+        /// null if it never stabilises.
+        /// </summary>
+        private int? StableWinding(in V3d c, in V3d dir, double edge, double diag)
+        {
+            var eps = (1e-2 * edge).Max(1e-9 * diag);
+            int? prev = null;
+            for (var attempt = 0; attempt < 24 && eps > 1e-13 * diag; attempt++, eps *= 0.5)
+            {
+                var w = WindingAt(c + eps * dir);
+                if (w == null) continue;
+                if (prev == w) return w;
+                prev = w;
+            }
+            return null;
         }
 
         /// <summary>
