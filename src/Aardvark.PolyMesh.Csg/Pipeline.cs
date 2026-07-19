@@ -44,7 +44,6 @@ namespace Aardvark.Geometry
 
         public bool HasCoincidentContact => m_coplanar.Count > 0;
 
-        private readonly Dictionary<long, Sign3> m_signCache = new(MixedLongComparer.Instance);
         private readonly Dictionary<(int, int, int), int> m_cutCache = new(); // (edgeMin, edgeMax, planeId) -> vid
 
         // spatial hash over all kernel vertices so coincident derived points
@@ -105,7 +104,14 @@ namespace Aardvark.Geometry
             Lap("weld");
             var pairs = BroadPhase();
             Lap($"broadphase ({pairs.Count} pairs)");
-            foreach (var (ta, tb) in pairs) ProcessPair(ta, tb);
+            // symbolic pair results in parallel (pure sign/interval math),
+            // materialization (ids, welding, constraint registration) in
+            // deterministic pair order
+            var pairResults = new PairResult[pairs.Count];
+            CsgParallel.For(0, pairs.Count, m_maxThreads, i =>
+                pairResults[i] = ComputePair(pairs[i].Item1, pairs[i].Item2));
+            for (var i = 0; i < pairs.Count; i++)
+                MaterializePair(pairs[i].Item1, pairs[i].Item2, pairResults[i]);
             Lap("narrowphase");
             Subdivide();
             Lap($"subdivide ({Fragments.Count} fragments)");
@@ -150,28 +156,52 @@ namespace Aardvark.Geometry
             // within the tolerance box around p (usually a single cell),
             // correctness comes from AreCoincident; hashed cell keys may alias,
             // which only adds candidates
-            var heads = new Dictionary<long, int>(n, MixedLongComparer.Instance);
+            // phase 1 (sequential): candidates near foreign meshes into the grid
+            var heads = new Dictionary<long, int>(1024, MixedLongComparer.Instance);
             var next = new int[n];
+            var candidates = new List<int>();
             for (var i = 0; i < n; i++)
             {
                 var p = m_kernel.Positions[i];
                 if (!foreign[m_kernel.VertexMesh[i]].Contains(p)) continue;
-                var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
-                var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
-                var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
-                var cz0 = (long)Fun.Floor((p.Z - tol) / h); var cz1 = (long)Fun.Floor((p.Z + tol) / h);
-                for (var dx = cx0; dx <= cx1; dx++)
-                    for (var dy = cy0; dy <= cy1; dy++)
-                        for (var dz = cz0; dz <= cz1; dz++)
-                        {
-                            if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
-                            for (; j >= 0; j = next[j])
-                                if (m_eps.AreCoincident(p, m_kernel.Positions[j])) Union(i, j);
-                        }
+                candidates.Add(i);
                 var key = CellKey((long)Fun.Floor(p.X / h), (long)Fun.Floor(p.Y / h), (long)Fun.Floor(p.Z / h));
                 next[i] = heads.TryGetValue(key, out var head) ? head : -1;
                 heads[key] = i;
             }
+
+            // phase 2 (parallel): probe the complete grid, collect coincident
+            // pairs; phase 3 (sequential): union them — components identical
+            // to incremental insertion because every coincident pair is found
+            var pairBags = new List<(int, int)>[Math.Max(1, m_maxThreads)];
+            var chunk = (candidates.Count + pairBags.Length - 1) / Math.Max(1, pairBags.Length);
+            CsgParallel.For(0, pairBags.Length, m_maxThreads, blk =>
+            {
+                var bag = pairBags[blk] = new List<(int, int)>();
+                var lo = blk * chunk;
+                var hi = Math.Min(lo + chunk, candidates.Count);
+                for (var ci = lo; ci < hi; ci++)
+                {
+                    var i = candidates[ci];
+                    var p = m_kernel.Positions[i];
+                    var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
+                    var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
+                    var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
+                    var cz0 = (long)Fun.Floor((p.Z - tol) / h); var cz1 = (long)Fun.Floor((p.Z + tol) / h);
+                    for (var dx = cx0; dx <= cx1; dx++)
+                        for (var dy = cy0; dy <= cy1; dy++)
+                            for (var dz = cz0; dz <= cz1; dz++)
+                            {
+                                if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
+                                for (; j >= 0; j = next[j])
+                                    if (j < i && m_eps.AreCoincident(p, m_kernel.Positions[j]))
+                                        bag.Add((i, j));
+                            }
+                }
+            });
+            foreach (var bag in pairBags)
+                if (bag != null)
+                    foreach (var (i, j) in bag) Union(i, j);
 
             Canon = new int[n].SetByIndex(i => Find(i));
 
@@ -237,14 +267,11 @@ namespace Aardvark.Geometry
 
         #region classification cache
 
+        // NOTE: no cache — HeightSign is pure and deterministic, so
+        // recomputation is exactly as consistent as memoization, and it makes
+        // the parallel narrow phase read-only
         private Sign3 Sign(int planeId, int vid)
-        {
-            var key = ((long)planeId << 32) | (uint)vid;
-            if (m_signCache.TryGetValue(key, out var s)) return s;
-            s = m_eps.HeightSign(m_kernel.Planes[planeId], m_kernel.Positions[vid], m_kernel.Generation[vid]);
-            m_signCache[key] = s;
-            return s;
-        }
+            => m_eps.HeightSign(m_kernel.Planes[planeId], m_kernel.Positions[vid], m_kernel.Generation[vid]);
 
         #endregion
 
@@ -305,7 +332,25 @@ namespace Aardvark.Geometry
             public CrossPt(int ea, int eb, V3d pos) { Vid = -1; EdgeA = ea; EdgeB = eb; Pos = pos; }
         }
 
-        private void ProcessPair(int ta, int tb)
+        private enum PairKind : byte { None, Coplanar, Segment }
+
+        private readonly struct PairResult
+        {
+            public readonly PairKind Kind;
+            public readonly bool CoplanarSame;
+            public readonly CrossPt Lo, Hi;
+            public readonly int LoCutPlane, HiCutPlane;
+            public PairResult(bool same) { Kind = PairKind.Coplanar; CoplanarSame = same; Lo = Hi = default; LoCutPlane = HiCutPlane = 0; }
+            public PairResult(CrossPt lo, int loPlane, CrossPt hi, int hiPlane)
+            { Kind = PairKind.Segment; CoplanarSame = false; Lo = lo; LoCutPlane = loPlane; Hi = hi; HiCutPlane = hiPlane; }
+        }
+
+        /// <summary>
+        /// Pure (read-only, deterministic) part of a pair: signs, coplanarity,
+        /// interval overlap. HeightSign is a pure function, so recomputing
+        /// per pair is exactly as consistent as the former shared cache.
+        /// </summary>
+        private PairResult ComputePair(int ta, int tb)
         {
             var pa = m_kernel.TriPlane[ta];
             var pb = m_kernel.TriPlane[tb];
@@ -315,45 +360,49 @@ namespace Aardvark.Geometry
             Span<Sign3> sb = stackalloc Sign3[3];
             Span<Sign3> sa = stackalloc Sign3[3];
             for (var i = 0; i < 3; i++) sb[i] = Sign(pa, vb[i]);
-            if (AllStrict(sb, Sign3.Above) || AllStrict(sb, Sign3.Below)) return;
+            if (AllStrict(sb, Sign3.Above) || AllStrict(sb, Sign3.Below)) return default;
             for (var i = 0; i < 3; i++) sa[i] = Sign(pb, va[i]);
-            if (AllStrict(sa, Sign3.Above) || AllStrict(sa, Sign3.Below)) return;
+            if (AllStrict(sa, Sign3.Above) || AllStrict(sa, Sign3.Below)) return default;
 
             if (AllOn(sa) && AllOn(sb))
             {
-                // tangent contact without 2D interior overlap (solids sharing a
-                // plane strip, an edge, a corner) needs no arrangement at all
-                if (!CoplanarInteriorsOverlap(va, vb, pa)) return;
-                // overlapping coplanar facets: subdivision happens via the
-                // side-face pairs (every facet boundary edge also belongs to a
-                // non-coplanar face); here we only record coverage for labeling
-                var same = m_kernel.Planes[pa].Normal.Dot(m_kernel.Planes[pb].Normal) > 0;
-                m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, same));
-                m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, same));
-                return;
+                if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
+                return new PairResult(m_kernel.Planes[pa].Normal.Dot(m_kernel.Planes[pb].Normal) > 0);
             }
 
             var crossA = CrossingPoints(va, sa, pb);
             var crossB = CrossingPoints(vb, sb, pa);
-            if (crossA.Count < 2 || crossB.Count < 2) return; // point touch or grazing
+            if (crossA.Count < 2 || crossB.Count < 2) return default;
 
-            // both segments lie on the intersection line of the two planes;
-            // the actual intersection is the overlap of the two intervals, and
-            // its endpoints are always existing crossing points of one triangle
             var dir = m_kernel.Planes[pa].Normal.Cross(m_kernel.Planes[pb].Normal);
             var (loA, hiA) = Interval(crossA, dir);
             var (loB, hiB) = Interval(crossB, dir);
             var (lo, loCutPlane) = loA.T > loB.T ? (loA, pb) : (loB, pa);
             var (hi, hiCutPlane) = hiA.T < hiB.T ? (hiA, pb) : (hiB, pa);
-            if (lo.T >= hi.T) return;
-            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, 1)) return; // point touch
+            if (lo.T >= hi.T) return default;
+            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, 1)) return default;
+            return new PairResult(lo.P, loCutPlane, hi.P, hiCutPlane);
+        }
 
-            var v0 = Materialize(lo.P, loCutPlane);
-            var v1 = Materialize(hi.P, hiCutPlane);
-            if (v0 == v1) return;
-
-            AddConstraint(ta, v0, v1);
-            AddConstraint(tb, v0, v1);
+        /// <summary>Order-dependent part: vertex ids, welding, registration.</summary>
+        private void MaterializePair(int ta, int tb, in PairResult r)
+        {
+            switch (r.Kind)
+            {
+                case PairKind.None: return;
+                case PairKind.Coplanar:
+                    m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, r.CoplanarSame));
+                    m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, r.CoplanarSame));
+                    return;
+                case PairKind.Segment:
+                    var v0 = Materialize(r.Lo, r.LoCutPlane);
+                    var v1 = Materialize(r.Hi, r.HiCutPlane);
+                    if (v0 == v1) return;
+                    AddConstraint(ta, v0, v1);
+                    AddConstraint(tb, v0, v1);
+                    return;
+                default: throw new InvalidOperationException();
+            }
         }
 
         private static bool AllStrict(Span<Sign3> s, Sign3 v) => s[0] == v && s[1] == v && s[2] == v;
@@ -754,15 +803,16 @@ namespace Aardvark.Geometry
             // fragment adjacency across shared (canonical) sub-edges via one sort
             var keys = new long[Fragments.Count * 3];
             var frags = new int[Fragments.Count * 3];
-            for (var f = 0; f < Fragments.Count; f++)
+            var fragmentCount = Fragments.Count;
+            CsgParallel.For(0, fragmentCount, m_maxThreads, f =>
             {
                 var frag = Fragments[f];
                 keys[f * 3] = EdgeKey(frag.V0, frag.V1);
                 keys[f * 3 + 1] = EdgeKey(frag.V1, frag.V2);
                 keys[f * 3 + 2] = EdgeKey(frag.V2, frag.V0);
                 frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
-            }
-            RadixSorter.SortEdgeKeys(keys, frags, keys.Length);
+            });
+            RadixSorter.SortEdgeKeys(keys, frags, keys.Length, m_maxThreads);
             // CSR adjacency (two passes over the sorted runs, no per-fragment lists)
             var nbrCount = new int[Fragments.Count];
             for (var pass = 0; pass < 2; pass++)

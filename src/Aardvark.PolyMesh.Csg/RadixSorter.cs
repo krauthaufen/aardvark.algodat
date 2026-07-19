@@ -1,4 +1,5 @@
 using System;
+using System.Threading.Tasks;
 
 namespace Aardvark.Geometry
 {
@@ -14,25 +15,54 @@ namespace Aardvark.Geometry
         private const int Mask = (1 << 11) - 1;
 
         /// <summary>Sorts keys (with parallel values) ascending. Requires both packed ids &lt; 2^22.</summary>
-        public static void SortEdgeKeys(long[] keys, int[] values, int count)
+        public static void SortEdgeKeys(long[] keys, int[] values, int count, int maxThreads = 1)
         {
+            var blocks = maxThreads <= 1 || count < 1 << 16
+                ? 1
+                : Math.Max(1, Math.Min(Math.Min(maxThreads, Environment.ProcessorCount), count / (1 << 14)));
             var tk = new long[count];
             var tv = new int[count];
-            var counts = new int[1 << 11];
             var srcK = keys; var srcV = values;
             var dstK = tk; var dstV = tv;
+            // blocked stable LSD: per-block histograms, global (digit, block)
+            // prefix, then each block scatters to precomputed offsets —
+            // deterministic and stable at any thread count
+            var histograms = new int[blocks][];
+            for (var b = 0; b < blocks; b++) histograms[b] = new int[1 << 11];
+            var blockSize = (count + blocks - 1) / blocks;
+
             foreach (var shift in s_shifts)
             {
-                Array.Clear(counts, 0, counts.Length);
-                for (var i = 0; i < count; i++) counts[(int)((ulong)srcK[i] >> shift) & Mask]++;
-                var sum = 0;
-                for (var b = 0; b < counts.Length; b++) { var c = counts[b]; counts[b] = sum; sum += c; }
-                for (var i = 0; i < count; i++)
+                var sk = srcK;
+                CsgParallel.For(0, blocks, blocks, blk =>
                 {
-                    var at = counts[(int)((ulong)srcK[i] >> shift) & Mask]++;
-                    dstK[at] = srcK[i];
-                    dstV[at] = srcV[i];
-                }
+                    var hist = histograms[blk];
+                    Array.Clear(hist, 0, hist.Length);
+                    var lo = blk * blockSize;
+                    var hi = Math.Min(lo + blockSize, count);
+                    for (var i = lo; i < hi; i++) hist[(int)((ulong)sk[i] >> shift) & Mask]++;
+                });
+                var sum = 0;
+                for (var d = 0; d <= Mask; d++)
+                    for (var b = 0; b < blocks; b++)
+                    {
+                        var c = histograms[b][d];
+                        histograms[b][d] = sum;
+                        sum += c;
+                    }
+                var sv = srcV; var dk = dstK; var dv = dstV;
+                CsgParallel.For(0, blocks, blocks, blk =>
+                {
+                    var offsets = histograms[blk];
+                    var lo = blk * blockSize;
+                    var hi = Math.Min(lo + blockSize, count);
+                    for (var i = lo; i < hi; i++)
+                    {
+                        var at = offsets[(int)((ulong)sk[i] >> shift) & Mask]++;
+                        dk[at] = sk[i];
+                        dv[at] = sv[i];
+                    }
+                });
                 (srcK, dstK) = (dstK, srcK);
                 (srcV, dstV) = (dstV, srcV);
             }

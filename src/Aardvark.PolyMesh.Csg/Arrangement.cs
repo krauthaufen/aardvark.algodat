@@ -254,7 +254,7 @@ namespace Aardvark.Geometry
             // 1. halfedge pairing: normal edges pair their two faces; at edges
             //    where more triangles meet (result volumes touching along a
             //    curve), faces are paired by dihedral angle into solid wedges
-            var pair = PairHalfedges(k, tris);
+            var pair = PairHalfedges(k, tris, maxThreads);
 
             // 2. components = connectivity through paired halfedges
             var componentOfFace = new int[tris.Count].Set(-1);
@@ -326,7 +326,7 @@ namespace Aardvark.Geometry
         /// continuations and ordered v→u first so they pair like a zero-angle
         /// wedge.
         /// </summary>
-        private static (int Tri, int Slot)[] PairHalfedges(Kernel k, List<EmitTri> tris)
+        private static (int Tri, int Slot)[] PairHalfedges(Kernel k, List<EmitTri> tris, int maxThreads)
         {
             var pair = new (int Tri, int Slot)[tris.Count * 3].Set((-1, -1));
             static int Corner(EmitTri t, int c) => c == 0 ? t.V0 : c == 1 ? t.V1 : t.V2;
@@ -334,13 +334,15 @@ namespace Aardvark.Geometry
             // one sort instead of a tuple-keyed dictionary of lists
             var keys = new long[tris.Count * 3];
             var hs = new int[tris.Count * 3];
-            for (var i = 0; i < tris.Count; i++)
-                for (var slot = 0; slot < 3; slot++)
-                {
-                    keys[i * 3 + slot] = Pipeline.EdgeKey(Corner(tris[i], slot), Corner(tris[i], (slot + 1) % 3));
-                    hs[i * 3 + slot] = i * 3 + slot;
-                }
-            RadixSorter.SortEdgeKeys(keys, hs, keys.Length);
+            CsgParallel.For(0, tris.Count, maxThreads, i =>
+            {
+                var t = tris[i];
+                keys[i * 3] = Pipeline.EdgeKey(t.V0, t.V1);
+                keys[i * 3 + 1] = Pipeline.EdgeKey(t.V1, t.V2);
+                keys[i * 3 + 2] = Pipeline.EdgeKey(t.V2, t.V0);
+                hs[i * 3] = i * 3; hs[i * 3 + 1] = i * 3 + 1; hs[i * 3 + 2] = i * 3 + 2;
+            });
+            RadixSorter.SortEdgeKeys(keys, hs, keys.Length, maxThreads);
 
             void Pair((int Tri, int Slot) a, (int Tri, int Slot) b)
             {
@@ -351,6 +353,14 @@ namespace Aardvark.Geometry
             var list = new List<(int Tri, int Slot)>(8);
             for (var gi = 0; gi < keys.Length;)
             {
+                // fast path: the overwhelmingly common 2-halfedge run
+                if (gi + 1 < keys.Length && keys[gi + 1] == keys[gi]
+                    && (gi + 2 >= keys.Length || keys[gi + 2] != keys[gi]))
+                {
+                    Pair((hs[gi] / 3, hs[gi] % 3), (hs[gi + 1] / 3, hs[gi + 1] % 3));
+                    gi += 2;
+                    continue;
+                }
                 var gj = gi + 1;
                 while (gj < keys.Length && keys[gj] == keys[gi]) gj++;
                 list.Clear();

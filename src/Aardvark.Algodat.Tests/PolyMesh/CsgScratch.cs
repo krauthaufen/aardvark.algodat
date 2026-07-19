@@ -265,10 +265,11 @@ namespace Aardvark.Geometry.Tests
         {
             var a = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(V3d.Zero, 1.0, 6));
             var b = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(new V3d(0.8, 0.3, 0.2), 1.0, 6));
-            Csg.Union(a, b); // warmup + BVH cache
+            var o = new CsgOptions { Verification = CsgVerification.InputOnly };
+            for (var i = 0; i < 4; i++) Csg.Union(a, b, o); // warmup
             Environment.SetEnvironmentVariable("CSG_PERF", "1");
             var sw = System.Diagnostics.Stopwatch.StartNew();
-            Csg.Union(a, b);
+            Csg.Union(a, b, o);
             Console.WriteLine($"TOTAL prepared union 2x81920 tris: {sw.ElapsedMilliseconds} ms");
             Environment.SetEnvironmentVariable("CSG_PERF", null);
         }

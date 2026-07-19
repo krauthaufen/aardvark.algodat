@@ -159,6 +159,19 @@ namespace Aardvark.Geometry
             var vertexOffset = Positions.Count;
             VertexOffset.Add(vertexOffset);
             VertexCount.Add(pos.Length);
+            // pre-size to avoid List growth churn on large solids
+            var triCount = solid.T0.Length;
+            if (Positions.Capacity < Positions.Count + pos.Length + pos.Length / 8)
+                Positions.Capacity = Positions.Count + pos.Length + pos.Length / 8;
+            if (Generation.Capacity < Positions.Capacity) Generation.Capacity = Positions.Capacity;
+            if (VertexMesh.Capacity < Positions.Capacity) VertexMesh.Capacity = Positions.Capacity;
+            if (T0.Capacity < T0.Count + triCount)
+            {
+                var cap = T0.Count + triCount;
+                T0.Capacity = cap; T1.Capacity = cap; T2.Capacity = cap;
+                TriPlane.Capacity = cap; TriMesh.Capacity = cap; TriFace.Capacity = cap;
+                C0.Capacity = cap; C1.Capacity = cap; C2.Capacity = cap;
+            }
             if (solid.HasTrafo)
             {
                 // materialize the lazy transformation while copying
