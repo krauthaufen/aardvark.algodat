@@ -11,6 +11,27 @@ namespace Aardvark.Geometry
     /// Used both to enforce the input contract and to verify output before it
     /// is handed to the user. Purely combinatorial — no geometry, no eps.
     /// </summary>
+    /// <summary>
+    /// Strong-mix hash for packed-long keys: long.GetHashCode() is hi^lo,
+    /// which collides catastrophically for packed (a,b) index pairs of
+    /// structured meshes and degenerates dictionaries to O(n) per op.
+    /// </summary>
+    internal sealed class MixedLongComparer : IEqualityComparer<long>
+    {
+        public static readonly MixedLongComparer Instance = new();
+        public bool Equals(long x, long y) => x == y;
+        public int GetHashCode(long x)
+        {
+            unchecked
+            {
+                var z = (ulong)x + 0x9E3779B97F4A7C15UL;
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9UL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBUL;
+                return (int)(z ^ (z >> 31));
+            }
+        }
+    }
+
     internal static class ManifoldChecks
     {
         /// <summary>
@@ -40,17 +61,18 @@ namespace Aardvark.Geometry
             }
             if (errors.Count > 0) return string.Join("; ", errors);
 
-            // directed edge map: (a,b) -> face; each undirected edge must occur
+            // directed edge map (long-keyed): each undirected edge must occur
             // exactly once per direction
-            var edges = new Dictionary<(int, int), int>(via.Length);
+            static long DKey(int a, int b) => ((long)a << 32) | (uint)b;
+            var edges = new Dictionary<long, int>(via.Length, MixedLongComparer.Instance);
             for (var fi = 0; fi < faceCount; fi++)
             {
                 var start = fia[fi]; var end = fia[fi + 1];
                 for (int i = start, j = end - 1; i < end; j = i++)
                 {
-                    var key = (via[j], via[i]);
+                    var key = DKey(via[j], via[i]);
                     if (edges.ContainsKey(key))
-                        Err($"directed edge {key.Item1}->{key.Item2} occurs twice (non-manifold or inconsistent winding)");
+                        Err($"directed edge {via[j]}->{via[i]} occurs twice (non-manifold or inconsistent winding)");
                     else
                         edges[key] = fi;
                 }
@@ -59,8 +81,8 @@ namespace Aardvark.Geometry
 
             foreach (var kvp in edges)
             {
-                var (a, b) = kvp.Key;
-                if (!edges.ContainsKey((b, a)))
+                var a = (int)(kvp.Key >> 32); var b = (int)kvp.Key;
+                if (!edges.ContainsKey(DKey(b, a)))
                     Err($"edge {a}->{b} has no opposite (open surface or inconsistent winding)");
             }
             if (errors.Count > 0) return string.Join("; ", errors);
@@ -68,8 +90,8 @@ namespace Aardvark.Geometry
             // vertex-link check: the faces around each vertex must form one
             // closed cycle (rejects bowtie / pinch vertices)
             var vertexFaceDegree = new int[vertexCount];
-            var outgoing = new Dictionary<int, (int To, int Face)>(via.Length); // one arbitrary outgoing edge per vertex
-            var successor = new Dictionary<(int, int), int>(via.Length);        // (v, w) -> next vertex after v in the face containing edge (v, w)
+            var outgoing = new int[vertexCount];
+            var successor = new Dictionary<long, int>(via.Length, MixedLongComparer.Instance); // (v, w) -> next vertex after v in the face containing edge (v, w)
             for (var fi = 0; fi < faceCount; fi++)
             {
                 var start = fia[fi]; var end = fia[fi + 1];
@@ -78,8 +100,8 @@ namespace Aardvark.Geometry
                     var v = via[i];
                     var w = via[i + 1 == end ? start : i + 1];
                     vertexFaceDegree[v]++;
-                    outgoing[v] = (w, fi);
-                    successor[(v, w)] = via[i + 2 >= end ? start + (i + 2 - end) : i + 2];
+                    outgoing[v] = w;
+                    successor[DKey(v, w)] = via[i + 2 >= end ? start + (i + 2 - end) : i + 2];
                 }
             }
             for (var v = 0; v < vertexCount; v++)
@@ -87,12 +109,12 @@ namespace Aardvark.Geometry
                 if (vertexFaceDegree[v] == 0) continue; // unreferenced vertex is allowed
                 // walk the fan: from edge (v,w) cross to the twin (w,v) and take
                 // its successor at v, until we return to the start edge
-                var startEdge = outgoing[v].To;
+                var startEdge = outgoing[v];
                 var w = startEdge;
                 var steps = 0;
                 do
                 {
-                    w = successor[(w, v)];
+                    w = successor[DKey(w, v)];
                     if (++steps > vertexFaceDegree[v]) break;
                 }
                 while (w != startEdge);

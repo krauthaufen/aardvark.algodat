@@ -153,6 +153,8 @@ namespace Aardvark.Geometry
         public static PolyMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
         {
             if (tris.Count == 0) return Array.Empty<PolyMesh>();
+            var sw = Environment.GetEnvironmentVariable("CSG_PERF") != null
+                ? System.Diagnostics.Stopwatch.StartNew() : null;
 
             // 1. halfedge pairing: normal edges pair their two faces; at edges
             //    where more triangles meet (result volumes touching along a
@@ -208,6 +210,7 @@ namespace Aardvark.Geometry
                 }
             }
 
+            if (sw != null) { Console.WriteLine($"PERF emit-pairing: {sw.Elapsed.TotalMilliseconds:0.0} ms"); sw.Restart(); }
             var result = new PolyMesh[componentCount];
             for (var ci = 0; ci < componentCount; ci++)
             {
@@ -216,6 +219,7 @@ namespace Aardvark.Geometry
                     if (componentOfFace[i] == ci) componentTris.Add(i);
                 result[ci] = BuildPolyMesh(k, tris, componentTris, Find, sources, verify);
             }
+            if (sw != null) Console.WriteLine($"PERF emit-build+verify ({tris.Count} tris): {sw.Elapsed.TotalMilliseconds:0.0} ms");
             return result;
         }
 
@@ -230,13 +234,18 @@ namespace Aardvark.Geometry
         private static (int Tri, int Slot)[] PairHalfedges(Kernel k, List<EmitTri> tris)
         {
             var pair = new (int Tri, int Slot)[tris.Count * 3].Set((-1, -1));
-            var edgeTris = new Dictionary<(int, int), List<(int Tri, int Slot)>>();
-            static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
             static int Corner(EmitTri t, int c) => c == 0 ? t.V0 : c == 1 ? t.V1 : t.V2;
+
+            // one sort instead of a tuple-keyed dictionary of lists
+            var keys = new long[tris.Count * 3];
+            var hs = new int[tris.Count * 3];
             for (var i = 0; i < tris.Count; i++)
                 for (var slot = 0; slot < 3; slot++)
-                    edgeTris.GetOrCreate(Key(Corner(tris[i], slot), Corner(tris[i], (slot + 1) % 3)),
-                        _ => new List<(int, int)>()).Add((i, slot));
+                {
+                    keys[i * 3 + slot] = Pipeline.EdgeKey(Corner(tris[i], slot), Corner(tris[i], (slot + 1) % 3));
+                    hs[i * 3 + slot] = i * 3 + slot;
+                }
+            Array.Sort(keys, hs);
 
             void Pair((int Tri, int Slot) a, (int Tri, int Slot) b)
             {
@@ -244,15 +253,23 @@ namespace Aardvark.Geometry
                 pair[b.Tri * 3 + b.Slot] = a;
             }
 
-            foreach (var (edge, list) in edgeTris)
+            var list = new List<(int Tri, int Slot)>(8);
+            for (var gi = 0; gi < keys.Length;)
             {
+                var gj = gi + 1;
+                while (gj < keys.Length && keys[gj] == keys[gi]) gj++;
+                list.Clear();
+                for (var x = gi; x < gj; x++) list.Add((hs[x] / 3, hs[x] % 3));
+                var groupKey = keys[gi];
+                gi = gj;
+
                 if (list.Count == 2)
                 {
                     Pair(list[0], list[1]);
                 }
                 else if (list.Count > 2)
                 {
-                    var (u, v) = edge;
+                    var u = (int)(groupKey >> 32); var v = (int)groupKey;
                     var d = (k.Positions[v] - k.Positions[u]).Normalized;
                     var ax0 = d.X.Abs() < 0.9 ? V3d.XAxis : V3d.YAxis;
                     var ax1 = d.Cross(ax0).Normalized;
@@ -287,6 +304,14 @@ namespace Aardvark.Geometry
             Kernel k, List<EmitTri> allTris, List<int> triIndices, Func<int, int> cornerGroupOf,
             PolyMesh[] sources, bool verify)
         {
+            var sw = Environment.GetEnvironmentVariable("CSG_PERF") != null
+                ? System.Diagnostics.Stopwatch.StartNew() : null;
+            void Lap(string what)
+            {
+                if (sw == null) return;
+                Console.WriteLine($"PERF   build-{what}: {sw.Elapsed.TotalMilliseconds:0.0} ms");
+                sw.Restart();
+            }
             var triCount = triIndices.Count;
             var tris = triIndices.Map(i => allTris[i]).ToList();
 
@@ -312,6 +337,7 @@ namespace Aardvark.Geometry
                 }
             }
 
+            Lap("compact");
             var positions = new V3d[kernelOfLocal.Count];
             for (var li = 0; li < positions.Length; li++)
                 positions[li] = k.Positions[kernelOfLocal[li]];
@@ -331,17 +357,20 @@ namespace Aardvark.Geometry
                 }
             }
 
+            Lap("rep");
             var mesh = new PolyMesh
             {
                 PositionArray = positions,
                 FirstIndexArray = fia,
                 VertexIndexArray = via,
             };
+            Lap("polymesh");
 
             EmitVertexAttributes(k, mesh, kernelOfLocal, repParent, repBary, sources);
             EmitFaceAttributes(k, mesh, tris, sources);
             EmitFaceVertexAttributes(k, mesh, tris, sources);
             EmitInstanceAttributes(k, mesh, tris, sources);
+            Lap("attrs");
 
             if (verify)
             {
@@ -349,6 +378,7 @@ namespace Aardvark.Geometry
                 if (violation != null)
                     throw new CsgVerificationException($"output verification failed: {violation}");
             }
+            Lap("verify");
             return mesh;
         }
 

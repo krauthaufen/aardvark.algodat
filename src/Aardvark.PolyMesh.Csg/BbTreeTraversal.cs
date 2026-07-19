@@ -1,43 +1,91 @@
 using System;
 using System.Collections.Generic;
-using System.Reflection;
 using Aardvark.Base;
 
 namespace Aardvark.Geometry
 {
     /// <summary>
-    /// Dual-tree traversal over Aardvark.Base.BbTree using the compressed
-    /// combined box array (Box3dAndFlags): each inner node stores, per box
-    /// side, the bound of whichever child does NOT achieve the parent union's
-    /// bound plus a flag naming that child; child boxes are reconstructed by
-    /// carrying the parent box down the descent.
+    /// Bounding-box tree over primitive boxes with dual-tree and ray
+    /// traversals, using Aardvark.Base.BbTree's compressed combined-box node
+    /// format (Box3dAndFlags): each inner node stores, per box side, the bound
+    /// of whichever child does NOT achieve the parent union's bound plus a
+    /// flag naming that child; child boxes are reconstructed by carrying the
+    /// parent box down the descent.
     ///
-    /// NOTE (migration): BbTree.m_combinedBoxArray is currently private, so it
-    /// is fetched via reflection once per tree. When these traversals move to
-    /// Aardvark.Base, add a public accessor instead.
+    /// The builder is a Morton-order median split (one sort, O(n) nodes) —
+    /// BbTree's SAH builder produces slightly better trees but costs three
+    /// sorts per node, which dominated whole-pipeline profiles.
+    ///
+    /// NOTE (migration): builder and traversals are BbTree-format-compatible
+    /// and intended to move to Aardvark.Base (as a fast-build option plus the
+    /// missing queries).
     /// </summary>
     internal sealed class CsgBvh
     {
-        private static readonly FieldInfo s_combinedField = typeof(BbTree)
-            .GetField("m_combinedBoxArray", BindingFlags.NonPublic | BindingFlags.Instance)!;
-
         public readonly int Count;
-        public readonly Box3d[] Leaves;         // per-primitive boxes (pre-enlarged by the caller)
-        public readonly BbTree? Tree;           // null for Count < 2
-        public readonly Box3dAndFlags[]? Combined;
+        public readonly Box3d[] Leaves;
+        private readonly int[] m_left = Array.Empty<int>();   // node refs: >= 0 inner node, < 0 leaf (-1 - prim)
+        private readonly int[] m_right = Array.Empty<int>();
+        private readonly Box3dAndFlags[] m_combined = Array.Empty<Box3dAndFlags>();
+        private readonly int m_root;
+        private readonly Box3d m_rootBox;
+        private int m_nodeCount;
 
         public CsgBvh(Box3d[] leafBoxes)
         {
             Count = leafBoxes.Length;
             Leaves = leafBoxes;
-            if (Count > 1)
+            if (Count == 0) { m_rootBox = Box3d.Invalid; m_root = 0; return; }
+            if (Count == 1) { m_rootBox = leafBoxes[0]; m_root = -1; return; }
+
+            var bounds = new Box3d(leafBoxes);
+            var order = new int[Count].SetByIndex(i => i);
+            var keys = new uint[Count];
+            var scale = new V3d(1023.0, 1023.0, 1023.0) / (bounds.Size + new V3d(1e-300));
+            for (var i = 0; i < Count; i++)
             {
-                Tree = new BbTree(leafBoxes, BbTree.BuildFlags.CreateCombinedArray | BbTree.BuildFlags.LeafLimit01);
-                Combined = (Box3dAndFlags[])s_combinedField.GetValue(Tree)!;
+                var c = (leafBoxes[i].Center - bounds.Min) * scale;
+                keys[i] = Morton((uint)c.X.Clamp(0, 1023), (uint)c.Y.Clamp(0, 1023), (uint)c.Z.Clamp(0, 1023));
             }
+            Array.Sort(keys, order);
+
+            m_left = new int[Count - 1];
+            m_right = new int[Count - 1];
+            m_combined = new Box3dAndFlags[Count - 1];
+            m_root = Build(order, 0, Count, out m_rootBox);
         }
 
-        public Box3d RootBox => Count == 0 ? Box3d.Invalid : Count == 1 ? Leaves[0] : Tree!.Box3d;
+        private static uint Morton(uint x, uint y, uint z)
+            => (Spread(x) << 2) | (Spread(y) << 1) | Spread(z);
+
+        private static uint Spread(uint v)
+        {
+            v = (v | (v << 16)) & 0x030000FF;
+            v = (v | (v << 8)) & 0x0300F00F;
+            v = (v | (v << 4)) & 0x030C30C3;
+            v = (v | (v << 2)) & 0x09249249;
+            return v;
+        }
+
+        private int Build(int[] order, int lo, int hi, out Box3d box)
+        {
+            if (hi - lo == 1)
+            {
+                box = Leaves[order[lo]];
+                return -1 - order[lo];
+            }
+            var mid = (lo + hi) / 2;
+            var l = Build(order, lo, mid, out var boxL);
+            var r = Build(order, mid, hi, out var boxR);
+            var ni = m_nodeCount++;
+            box = Box.Union(boxL, boxR);
+            m_left[ni] = l;
+            m_right[ni] = r;
+            m_combined[ni] = new Box3dAndFlags(box, boxL, boxR);
+            return ni;
+        }
+
+        public Box3d RootBox => m_rootBox;
 
         private static Box3d Child0(in Box3dAndFlags c, in Box3d parent) => new(
             new V3d((c.BFlags & Box.Flags.MinX0) != 0 ? c.BBox.Min.X : parent.Min.X,
@@ -56,15 +104,15 @@ namespace Aardvark.Geometry
                     (c.BFlags & Box.Flags.MaxZ1) != 0 ? c.BBox.Max.Z : parent.Max.Z));
 
         /// <summary>
-        /// Enumerates primitives whose (pre-enlarged) leaf boxes are hit by the
-        /// ray from o along dir (t >= 0), mapped through primToUser.
+        /// Enumerates primitives whose leaf boxes are hit by the ray from o
+        /// along dir (t >= 0), mapped through primToUser.
         /// </summary>
         public IEnumerable<int> RayCandidates(V3d o, V3d dir, int[] primToUser)
         {
             if (Count == 0) yield break;
             var inv = new V3d(1.0 / dir.X, 1.0 / dir.Y, 1.0 / dir.Z);
             var stack = new Stack<(int Ref, Box3d Box)>();
-            stack.Push((Count == 1 ? -1 : 0, RootBox));
+            stack.Push((m_root, m_rootBox));
             while (stack.Count > 0)
             {
                 var (r, box) = stack.Pop();
@@ -75,9 +123,9 @@ namespace Aardvark.Geometry
                 }
                 else
                 {
-                    var c = Combined![r];
-                    stack.Push((Tree!.GetLeft(r), Child0(c, box)));
-                    stack.Push((Tree!.GetRight(r), Child1(c, box)));
+                    var c = m_combined[r];
+                    stack.Push((m_left[r], Child0(c, box)));
+                    stack.Push((m_right[r], Child1(c, box)));
                 }
             }
         }
@@ -92,20 +140,13 @@ namespace Aardvark.Geometry
             return tMax >= tMin;
         }
 
-        /// <summary>
-        /// Reports every primitive pair (i in this, j in other) whose leaf
-        /// boxes intersect. Leaf boxes should be pre-enlarged with the eps
-        /// slack by the caller.
-        /// </summary>
+        /// <summary>Reports every primitive pair (i in this, j in other) whose leaf boxes intersect.</summary>
         public void ForEachIntersectingPair(CsgBvh other, Action<int, int> emit)
         {
             if (Count == 0 || other.Count == 0) return;
 
-            // node refs: >= 0 inner node index, < 0 leaf primitive (-1 - prim)
             var stack = new Stack<(int RefA, Box3d BoxA, int RefB, Box3d BoxB)>();
-            var rootA = Count == 1 ? -1 : 0;
-            var rootB = other.Count == 1 ? -1 : 0;
-            stack.Push((rootA, RootBox, rootB, other.RootBox));
+            stack.Push((m_root, m_rootBox, other.m_root, other.m_rootBox));
 
             while (stack.Count > 0)
             {
@@ -120,17 +161,15 @@ namespace Aardvark.Geometry
                 }
                 else if (leafA || (!leafB && bb.Volume > ba.Volume))
                 {
-                    // descend B
-                    var c = other.Combined![rb];
-                    stack.Push((ra, ba, other.Tree!.GetLeft(rb), Child0(c, bb)));
-                    stack.Push((ra, ba, other.Tree!.GetRight(rb), Child1(c, bb)));
+                    var c = other.m_combined[rb];
+                    stack.Push((ra, ba, other.m_left[rb], Child0(c, bb)));
+                    stack.Push((ra, ba, other.m_right[rb], Child1(c, bb)));
                 }
                 else
                 {
-                    // descend A
-                    var c = Combined![ra];
-                    stack.Push((Tree!.GetLeft(ra), Child0(c, ba), rb, bb));
-                    stack.Push((Tree!.GetRight(ra), Child1(c, ba), rb, bb));
+                    var c = m_combined[ra];
+                    stack.Push((m_left[ra], Child0(c, ba), rb, bb));
+                    stack.Push((m_right[ra], Child1(c, ba), rb, bb));
                 }
             }
         }

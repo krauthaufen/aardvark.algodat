@@ -38,21 +38,38 @@ namespace Aardvark.Geometry
         public readonly List<Fragment> Fragments = new();
         public readonly List<FragLabel> Labels = new();
 
-        private readonly Dictionary<long, Sign3> m_signCache = new();
+        private readonly Dictionary<long, Sign3> m_signCache = new(MixedLongComparer.Instance);
         private readonly Dictionary<(int, int, int), int> m_cutCache = new(); // (edgeMin, edgeMax, planeId) -> vid
 
         // spatial hash over all kernel vertices so coincident derived points
         // (triple-plane corners reached via different edge/plane cuts) weld to
         // one canonical vertex; the grid is a candidate filter only,
         // correctness comes from AreCoincident
-        private readonly Dictionary<(long, long, long), List<int>> m_vertexGrid = new();
+        private readonly Dictionary<long, int> m_vertexGridHeads = new();
+        private readonly List<int> m_vertexGridNext = new();
         private double m_gridH = 1.0;
+
+        private static long CellKey(long x, long y, long z)
+        {
+            unchecked
+            {
+                var h = (ulong)x * 0x9E3779B97F4A7C15UL;
+                h ^= (ulong)y * 0xC2B2AE3D27D4EB4FUL;
+                h ^= (ulong)z * 0x165667B19E3779F9UL;
+                h ^= h >> 29;
+                return (long)h;
+            }
+        }
         private readonly Dictionary<(int, int), HashSet<int>> m_edgePoints = new(); // canonical edge -> points on it
         private readonly Dictionary<int, HashSet<(int, int)>> m_faceConstraints = new(); // kernel tri -> segments
-        private readonly HashSet<(int, int)>[] m_barriers = { new(), new() }; // per mesh: constraint sub-edges
+        private readonly HashSet<long>[] m_barriers = { new(MixedLongComparer.Instance), new(MixedLongComparer.Instance) }; // per mesh: constraint sub-edges (packed keys)
         private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
         private readonly CsgBvh?[] m_bvh = new CsgBvh?[2];
         private readonly int[][] m_triOf = new int[2][];
+        private Box3d[][] m_pairPhaseBoxes = new Box3d[2][];
+
+        private CsgBvh RayBvh(int mesh)
+            => m_bvh[mesh] ??= new CsgBvh(m_pairPhaseBoxes[mesh]);
 
         public Pipeline(Kernel kernel)
         {
@@ -63,11 +80,24 @@ namespace Aardvark.Geometry
 
         public void Run()
         {
+            var perf = Environment.GetEnvironmentVariable("CSG_PERF") != null;
+            var sw = perf ? System.Diagnostics.Stopwatch.StartNew() : null;
+            void Lap(string stage)
+            {
+                if (sw == null) return;
+                Console.WriteLine($"PERF {stage}: {sw.Elapsed.TotalMilliseconds:0.0} ms");
+                sw.Restart();
+            }
             WeldVertices();
+            Lap("weld");
             var pairs = BroadPhase();
+            Lap($"broadphase ({pairs.Count} pairs)");
             foreach (var (ta, tb) in pairs) ProcessPair(ta, tb);
+            Lap("narrowphase");
             Subdivide();
+            Lap($"subdivide ({Fragments.Count} fragments)");
             Classify();
+            Lap("classify");
         }
 
         #region welding
@@ -86,24 +116,32 @@ namespace Aardvark.Geometry
 
             var maxMag = 0.0;
             for (var i = 0; i < n; i++) maxMag = maxMag.Max(m_kernel.Positions[i].NormMax);
-            var h = (2 * m_eps.Relative * maxMag).Max(1e-300);
+            var h = (3 * m_eps.Relative * maxMag).Max(1e-300);
 
-            // hash grid is a candidate filter only: any coincident pair is within
-            // one cell in every axis, correctness comes from AreCoincident
-            var grid = new Dictionary<(long, long, long), List<int>>();
+            // hash grid is a candidate filter only: any coincident pair lies
+            // within the tolerance box around p (usually a single cell),
+            // correctness comes from AreCoincident; hashed cell keys may alias,
+            // which only adds candidates
+            var heads = new Dictionary<long, int>(n);
+            var next = new int[n];
             for (var i = 0; i < n; i++)
             {
                 var p = m_kernel.Positions[i];
-                var cx = (long)Fun.Floor(p.X / h); var cy = (long)Fun.Floor(p.Y / h); var cz = (long)Fun.Floor(p.Z / h);
-                for (var dx = -1L; dx <= 1; dx++)
-                    for (var dy = -1L; dy <= 1; dy++)
-                        for (var dz = -1L; dz <= 1; dz++)
+                var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
+                var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
+                var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
+                var cz0 = (long)Fun.Floor((p.Z - tol) / h); var cz1 = (long)Fun.Floor((p.Z + tol) / h);
+                for (var dx = cx0; dx <= cx1; dx++)
+                    for (var dy = cy0; dy <= cy1; dy++)
+                        for (var dz = cz0; dz <= cz1; dz++)
                         {
-                            if (!grid.TryGetValue((cx + dx, cy + dy, cz + dz), out var cell)) continue;
-                            foreach (var j in cell)
+                            if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
+                            for (; j >= 0; j = next[j])
                                 if (m_eps.AreCoincident(p, m_kernel.Positions[j])) Union(i, j);
                         }
-                grid.GetOrCreate((cx, cy, cz), _ => new List<int>()).Add(i);
+                var key = CellKey((long)Fun.Floor(p.X / h), (long)Fun.Floor(p.Y / h), (long)Fun.Floor(p.Z / h));
+                next[i] = heads.TryGetValue(key, out var head) ? head : -1;
+                heads[key] = i;
             }
 
             Canon = new int[n].SetByIndex(i => Find(i));
@@ -127,27 +165,33 @@ namespace Aardvark.Geometry
 
             // persistent vertex grid over canonical vertices; sized so that a
             // generation-1 coincidence tolerance still fits one neighbor cell
-            m_gridH = (16 * m_eps.Relative * maxMag).Max(1e-300);
+            m_gridH = (24 * m_eps.Relative * maxMag).Max(1e-300);
             for (var i = 0; i < n; i++)
                 if (Canon[i] == i) GridAdd(i);
         }
 
-        private (long, long, long) GridCell(in V3d p)
-            => ((long)Fun.Floor(p.X / m_gridH), (long)Fun.Floor(p.Y / m_gridH), (long)Fun.Floor(p.Z / m_gridH));
-
         private void GridAdd(int vid)
-            => m_vertexGrid.GetOrCreate(GridCell(m_kernel.Positions[vid]), _ => new List<int>()).Add(vid);
+        {
+            var p = m_kernel.Positions[vid];
+            var key = CellKey((long)Fun.Floor(p.X / m_gridH), (long)Fun.Floor(p.Y / m_gridH), (long)Fun.Floor(p.Z / m_gridH));
+            while (m_vertexGridNext.Count <= vid) m_vertexGridNext.Add(-1);
+            m_vertexGridNext[vid] = m_vertexGridHeads.TryGetValue(key, out var head) ? head : -1;
+            m_vertexGridHeads[key] = vid;
+        }
 
         /// <summary>Existing kernel vertex coincident with p (generation-1 tolerance), or -1.</summary>
         private int GridFindCoincident(in V3d p)
         {
-            var (cx, cy, cz) = GridCell(p);
-            for (var dx = -1L; dx <= 1; dx++)
-                for (var dy = -1L; dy <= 1; dy++)
-                    for (var dz = -1L; dz <= 1; dz++)
+            var tol = 8 * m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
+            var cx0 = (long)Fun.Floor((p.X - tol) / m_gridH); var cx1 = (long)Fun.Floor((p.X + tol) / m_gridH);
+            var cy0 = (long)Fun.Floor((p.Y - tol) / m_gridH); var cy1 = (long)Fun.Floor((p.Y + tol) / m_gridH);
+            var cz0 = (long)Fun.Floor((p.Z - tol) / m_gridH); var cz1 = (long)Fun.Floor((p.Z + tol) / m_gridH);
+            for (var dx = cx0; dx <= cx1; dx++)
+                for (var dy = cy0; dy <= cy1; dy++)
+                    for (var dz = cz0; dz <= cz1; dz++)
                     {
-                        if (!m_vertexGrid.TryGetValue((cx + dx, cy + dy, cz + dz), out var cell)) continue;
-                        foreach (var j in cell)
+                        if (!m_vertexGridHeads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
+                        for (; j >= 0; j = m_vertexGridNext[j])
                             if (m_eps.AreCoincident(p, m_kernel.Positions[j], 1)) return j;
                     }
             return -1;
@@ -172,10 +216,22 @@ namespace Aardvark.Geometry
 
         private List<(int, int)> BroadPhase()
         {
+            // pair-phase BVHs contain only triangles whose box reaches the
+            // other mesh's bounds — nothing else can produce a candidate pair,
+            // and the (expensive) SAH build shrinks to the overlap region.
+            // Ray-parity BVHs must cover whole meshes and are built separately.
+            var slackScene = 8 * m_eps.Relative * (m_eps.Scene + 1e-300);
+            var pairBox = new Box3d[2];
+            for (var m = 0; m < 2; m++) pairBox[m] = m_kernel.Bounds[1 - m].EnlargedBy(2 * slackScene);
+
             var boxes = new Box3d[2][];
+            var pairTriOf = new int[2][];
+            var pairBoxes = new List<Box3d>[2];
             for (var m = 0; m < 2; m++)
             {
                 var list = new List<int>();
+                var pairList = new List<int>();
+                pairBoxes[m] = new List<Box3d>();
                 for (var t = 0; t < m_kernel.TriangleCount; t++)
                     if (m_kernel.TriMesh[t] == m) list.Add(t);
                 m_triOf[m] = list.ToArray();
@@ -186,15 +242,16 @@ namespace Aardvark.Geometry
                     var p0 = m_kernel.Positions[m_kernel.T0[t]];
                     var p1 = m_kernel.Positions[m_kernel.T1[t]];
                     var p2 = m_kernel.Positions[m_kernel.T2[t]];
-                    var box = new Box3d(p0, p1, p2);
-                    var slack = 8 * m_eps.Relative * box.Min.NormMax.Max(box.Max.NormMax);
-                    boxes[m][i] = box.EnlargedBy(slack);
+                    var box = new Box3d(p0, p1, p2).EnlargedBy(slackScene);
+                    boxes[m][i] = box;
+                    if (box.Intersects(pairBox[m])) { pairList.Add(t); pairBoxes[m].Add(box); }
                 }
-                m_bvh[m] = new CsgBvh(boxes[m]);
+                pairTriOf[m] = pairList.ToArray();
             }
             var pairs = new List<(int, int)>();
-            m_bvh[0]!.ForEachIntersectingPair(m_bvh[1]!,
-                (i, j) => pairs.Add((m_triOf[0][i], m_triOf[1][j])));
+            new CsgBvh(pairBoxes[0].ToArray()).ForEachIntersectingPair(new CsgBvh(pairBoxes[1].ToArray()),
+                (i, j) => pairs.Add((pairTriOf[0][i], pairTriOf[1][j])));
+            m_pairPhaseBoxes = boxes;
             return pairs;
         }
 
@@ -376,6 +433,9 @@ namespace Aardvark.Geometry
 
         private static (int, int) SortedEdge(int a, int b) => a < b ? (a, b) : (b, a);
 
+        internal static long EdgeKey(int a, int b)
+            => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+
         private void AddConstraint(int tri, int v0, int v1)
             => m_faceConstraints.GetOrCreate(tri, _ => new HashSet<(int, int)>()).Add(SortedEdge(v0, v1));
 
@@ -474,7 +534,7 @@ namespace Aardvark.Geometry
                 }
                 foreach (var (a, b, c) in tris) Fragments.Add(new Fragment(a, b, c, tri));
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
-                foreach (var (a, b) in constraintEdges) barrier.Add(SortedEdge(a, b));
+                foreach (var (a, b) in constraintEdges) barrier.Add(EdgeKey(a, b));
             }
         }
 
@@ -519,15 +579,37 @@ namespace Aardvark.Geometry
 
         private void Classify()
         {
-            // fragment adjacency per mesh across shared (canonical) sub-edges,
-            // with intersection-curve edges acting as barriers
-            var edgeToFragments = new Dictionary<(int, int), List<int>>[] { new(), new() };
+            // fragment adjacency across shared (canonical) sub-edges via one
+            // sort per mesh (edge key packs the mesh in the low bit region is
+            // unnecessary: keys already collide only within a mesh's flood)
+            var keys = new long[Fragments.Count * 3];
+            var frags = new int[Fragments.Count * 3];
             for (var f = 0; f < Fragments.Count; f++)
             {
                 var frag = Fragments[f];
-                var mesh = m_kernel.TriMesh[frag.Parent];
-                foreach (var e in FragmentEdges(frag))
-                    edgeToFragments[mesh].GetOrCreate(e, _ => new List<int>()).Add(f);
+                keys[f * 3] = EdgeKey(frag.V0, frag.V1);
+                keys[f * 3 + 1] = EdgeKey(frag.V1, frag.V2);
+                keys[f * 3 + 2] = EdgeKey(frag.V2, frag.V0);
+                frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
+            }
+            Array.Sort(keys, frags);
+            // neighbors per fragment (grouped runs of equal keys, same mesh, non-barrier)
+            var adjacency = new List<int>[Fragments.Count].SetByIndex(_ => new List<int>(3));
+            for (var i = 0; i < keys.Length;)
+            {
+                var j = i + 1;
+                while (j < keys.Length && keys[j] == keys[i]) j++;
+                for (var x = i; x < j; x++)
+                    for (var y = x + 1; y < j; y++)
+                    {
+                        var fx = frags[x]; var fy = frags[y];
+                        var mesh = m_kernel.TriMesh[Fragments[fx].Parent];
+                        if (m_kernel.TriMesh[Fragments[fy].Parent] != mesh) continue;
+                        if (m_barriers[mesh].Contains(keys[i])) continue;
+                        adjacency[fx].Add(fy);
+                        adjacency[fy].Add(fx);
+                    }
+                i = j;
             }
 
             Labels.Clear();
@@ -563,15 +645,11 @@ namespace Aardvark.Geometry
                 {
                     var f = stack.Pop();
                     region.Add(f);
-                    foreach (var e in FragmentEdges(Fragments[f]))
+                    foreach (var g in adjacency[f])
                     {
-                        if (m_barriers[mesh].Contains(e)) continue;
-                        foreach (var g in edgeToFragments[mesh][e])
-                        {
-                            if (labeled[g]) continue;
-                            labeled[g] = true;
-                            stack.Push(g);
-                        }
+                        if (labeled[g]) continue;
+                        labeled[g] = true;
+                        stack.Push(g);
                     }
                 }
 
@@ -603,13 +681,6 @@ namespace Aardvark.Geometry
                 && m_eps.AreaSign(t[2], t[0], q, 1) != Sign3.Below;
         }
 
-        private IEnumerable<(int, int)> FragmentEdges(Fragment f)
-        {
-            yield return SortedEdge(f.V0, f.V1);
-            yield return SortedEdge(f.V1, f.V2);
-            yield return SortedEdge(f.V2, f.V0);
-        }
-
         private bool RegionIsInsideOther(List<int> region, int otherMesh)
         {
             // try region fragments in order; per fragment try the ray directions:
@@ -631,7 +702,7 @@ namespace Aardvark.Geometry
         private bool? RayParity(V3d o, V3d dir, int otherMesh)
         {
             var count = 0;
-            foreach (var t in m_bvh[otherMesh]!.RayCandidates(o, dir, m_triOf[otherMesh]))
+            foreach (var t in RayBvh(otherMesh).RayCandidates(o, dir, m_triOf[otherMesh]))
             {
                 var plane = m_kernel.Planes[m_kernel.TriPlane[t]];
                 var denom = plane.Normal.Dot(dir);
