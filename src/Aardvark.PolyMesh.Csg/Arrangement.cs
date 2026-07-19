@@ -329,7 +329,7 @@ namespace Aardvark.Geometry
                     keys[i * 3 + slot] = Pipeline.EdgeKey(Corner(tris[i], slot), Corner(tris[i], (slot + 1) % 3));
                     hs[i * 3 + slot] = i * 3 + slot;
                 }
-            Array.Sort(keys, hs);
+            RadixSorter.SortEdgeKeys(keys, hs, keys.Length);
 
             void Pair((int Tri, int Slot) a, (int Tri, int Slot) b)
             {
@@ -427,17 +427,24 @@ namespace Aardvark.Geometry
                 positions[li] = k.Positions[kernelOfLocal[li]];
 
             // one representative (parent, barycentric) per output vertex for
-            // channel synthesis
-            var repParent = new int[kernelOfLocal.Count].Set(-1);
-            var repBary = new V3d[kernelOfLocal.Count];
-            for (var i = 0; i < triCount; i++)
+            // channel synthesis — only when vertex channels will be emitted
+            var vertexDicts = sources.Map(src => src.VertexAttributes);
+            var hasVertexChannels = CommonChannels(vertexDicts, PolyMesh.Property.Positions).Any();
+            var repParent = Array.Empty<int>();
+            var repBary = Array.Empty<V3d>();
+            if (hasVertexChannels)
             {
-                for (var c = 0; c < 3; c++)
+                repParent = new int[kernelOfLocal.Count].Set(-1);
+                repBary = new V3d[kernelOfLocal.Count];
+                for (var i = 0; i < triCount; i++)
                 {
-                    var li = via[i * 3 + c];
-                    if (repParent[li] >= 0) continue;
-                    repParent[li] = tris[i].Parent;
-                    repBary[li] = Barycentric(k, tris[i].Parent, k.Positions[kernelOfLocal[li]]);
+                    for (var c = 0; c < 3; c++)
+                    {
+                        var li = via[i * 3 + c];
+                        if (repParent[li] >= 0) continue;
+                        repParent[li] = tris[i].Parent;
+                        repBary[li] = Barycentric(k, tris[i].Parent, k.Positions[kernelOfLocal[li]]);
+                    }
                 }
             }
 

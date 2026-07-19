@@ -154,7 +154,7 @@ namespace Aardvark.Geometry
                 keys[t + 1] = UKey(via[t + 1], via[t + 2]); ids[t + 1] = t + 1;
                 keys[t + 2] = UKey(via[t + 2], via[t]); ids[t + 2] = t + 2;
             }
-            Array.Sort(keys, ids);
+            RadixSorter.SortEdgeKeys(keys, ids, h);
 
             var twin = new int[h];
             for (var i = 0; i < h;)

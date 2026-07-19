@@ -220,6 +220,51 @@ namespace Aardvark.Geometry.Tests
 
         [Test]
         [Explicit]
+        public void Bench()
+        {
+            double Median(double[] xs) { Array.Sort(xs); return xs[xs.Length / 2]; }
+
+            double Measure(Action op, int warmup = 3, int iterations = 9)
+            {
+                for (var i = 0; i < warmup; i++) op();
+                var times = new double[iterations];
+                for (var i = 0; i < iterations; i++)
+                {
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    op();
+                    times[i] = sw.Elapsed.TotalMilliseconds;
+                }
+                return Median(times);
+            }
+
+            var inputOnly = new CsgOptions { Verification = CsgVerification.InputOnly };
+            Console.WriteLine($"{"case",-22} {"tris",8} {"polymesh",10} {"prepared",10} {"prep+io",10}");
+            foreach (var sub in new[] { 3, 4, 5, 6 })
+            {
+                var pa = CsgM5Tests.Icosphere(V3d.Zero, 1.0, sub);
+                var pb = CsgM5Tests.Icosphere(new V3d(0.8, 0.3, 0.2), 1.0, sub);
+                var a = CsgMesh.FromPolyMesh(pa);
+                var b = CsgMesh.FromPolyMesh(pb);
+                var tris = (pa.FirstIndexArray.Length - 1) * 2;
+                var mPoly = Measure(() => Csg.Union(pa, pb));
+                var mPrep = Measure(() => Csg.Union(a, b));
+                var mPrepIo = Measure(() => Csg.Union(a, b, inputOnly));
+                Console.WriteLine($"{"sphere-" + sub,-22} {tris,8} {mPoly,9:0.0}m {mPrep,9:0.0}m {mPrepIo,9:0.0}m");
+            }
+            {
+                var pa = CsgM6Tests.LPrism();
+                var pb = CsgM6Tests.LPrism().Transformed(Trafo3d.RotationZInDegrees(90) * Trafo3d.Translation(1.75, 0.25, 0.3));
+                var a = CsgMesh.FromPolyMesh(pa);
+                var b = CsgMesh.FromPolyMesh(pb);
+                var mPoly = Measure(() => Csg.Union(pa, pb));
+                var mPrep = Measure(() => Csg.Union(a, b));
+                var mPrepIo = Measure(() => Csg.Union(a, b, inputOnly));
+                Console.WriteLine($"{"lprism-lprism",-22} {40,8} {mPoly,9:0.0}m {mPrep,9:0.0}m {mPrepIo,9:0.0}m");
+            }
+        }
+
+        [Test]
+        [Explicit]
         public void PerfPrepared()
         {
             var a = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(V3d.Zero, 1.0, 6));

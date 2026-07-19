@@ -128,6 +128,21 @@ namespace Aardvark.Geometry
             for (var i = 0; i < n; i++) maxMag = maxMag.Max(m_kernel.Positions[i].NormMax);
             var h = (3 * m_eps.Relative * maxMag).Max(1e-300);
 
+            // prescreen: a vertex can only weld with one within tolerance of a
+            // FOREIGN mesh's bounds; vertices far from every other mesh skip
+            // the grid entirely (distant same-mesh coincidences cannot affect
+            // the boolean — they are re-emitted exactly as they came in)
+            var meshCount = m_kernel.MeshCount;
+            var foreign = new Box3d[meshCount];
+            var inflate = 4 * m_eps.Relative * maxMag;
+            for (var m = 0; m < meshCount; m++)
+            {
+                var box = Box3d.Invalid;
+                for (var o = 0; o < meshCount; o++)
+                    if (o != m) box.ExtendBy(m_kernel.Bounds[o]);
+                foreign[m] = box.EnlargedBy(inflate);
+            }
+
             // hash grid is a candidate filter only: any coincident pair lies
             // within the tolerance box around p (usually a single cell),
             // correctness comes from AreCoincident; hashed cell keys may alias,
@@ -137,6 +152,7 @@ namespace Aardvark.Geometry
             for (var i = 0; i < n; i++)
             {
                 var p = m_kernel.Positions[i];
+                if (!foreign[m_kernel.VertexMesh[i]].Contains(p)) continue;
                 var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
                 var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
                 var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
@@ -748,7 +764,7 @@ namespace Aardvark.Geometry
                 keys[f * 3 + 2] = EdgeKey(frag.V2, frag.V0);
                 frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
             }
-            Array.Sort(keys, frags);
+            RadixSorter.SortEdgeKeys(keys, frags, keys.Length);
             // CSR adjacency (two passes over the sorted runs, no per-fragment lists)
             var nbrCount = new int[Fragments.Count];
             for (var pass = 0; pass < 2; pass++)
