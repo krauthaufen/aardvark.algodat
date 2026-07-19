@@ -21,6 +21,7 @@ namespace Aardvark.Geometry
     internal sealed class FaceCdt
     {
         private readonly Eps m_eps;
+        private double m_factor = Eps.GenerationFactor;
         private readonly List<int> m_kernelIds = new();
         private readonly List<V2d> m_pos = new();
         private readonly Dictionary<int, int> m_localOfKernel = new();
@@ -44,10 +45,11 @@ namespace Aardvark.Geometry
         private static FaceCdt? s_pooled;
 
         /// <summary>Thread-local pooled instance (avoids ~10 collection allocations per cut face).</summary>
-        public static FaceCdt Rent(Eps eps, int k0, V2d p0, int k1, V2d p1, int k2, V2d p2)
+        public static FaceCdt Rent(Eps eps, double factor, int k0, V2d p0, int k1, V2d p1, int k2, V2d p2)
         {
             var cdt = s_pooled;
             if (cdt == null || !cdt.m_eps.Equals(eps)) s_pooled = cdt = new FaceCdt(eps);
+            cdt.m_factor = factor;
             cdt.Reset(k0, p0, k1, p1, k2, p2);
             return cdt;
         }
@@ -87,7 +89,7 @@ namespace Aardvark.Geometry
         /// pipeline (which classifies cuts at generation 1) and the CDT would
         /// let a point count as on-edge in one and outside in the other.
         /// </summary>
-        private Sign3 Area(in V2d a, in V2d b, in V2d c) => m_eps.AreaSign(a, b, c, 1);
+        private Sign3 Area(in V2d a, in V2d b, in V2d c) => m_eps.AreaSign(a, b, c, m_factor);
 
         private static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
 
@@ -113,7 +115,7 @@ namespace Aardvark.Geometry
                     // then continue with the edge line the point is closer to
                     var corner = s0 == Sign3.On && s1 == Sign3.On ? b
                                : s1 == Sign3.On && s2 == Sign3.On ? c : a;
-                    if (m_eps.AreCoincident(p, m_pos[corner], 1))
+                    if (m_eps.AreCoincident(p, m_pos[corner], m_factor))
                     {
                         m_localOfKernel[kernelId] = corner;
                         return corner;
@@ -376,7 +378,12 @@ namespace Aardvark.Geometry
             }
             var faceArea = 0.5 * ((m_pos[1].X - m_pos[0].X) * (m_pos[2].Y - m_pos[0].Y)
                                 - (m_pos[1].Y - m_pos[0].Y) * (m_pos[2].X - m_pos[0].X));
-            if ((area - faceArea).Abs() > 1e-6 * faceArea.Abs() + m_eps.Relative)
+            // healed degenerate slivers may each carry up to one widened
+            // area-tolerance of the face factor
+            var l = Fun.Max((m_pos[1] - m_pos[0]).NormMax, (m_pos[2] - m_pos[0]).NormMax, (m_pos[2] - m_pos[1]).NormMax);
+            var m = Fun.Max(m_pos[0].NormMax, m_pos[1].NormMax, m_pos[2].NormMax);
+            var sliverAllowance = m_factor * m_eps.Relative * (m + l + m_eps.Scene) * l * (m_pos.Count + 1);
+            if ((area - faceArea).Abs() > 1e-6 * faceArea.Abs() + sliverAllowance + m_eps.Relative)
                 throw new CsgVerificationException(
                     $"face triangulation does not cover the face (area {area} vs {faceArea})");
 

@@ -42,8 +42,17 @@ namespace Aardvark.Geometry
         /// </summary>
         public readonly double Scene;
 
-        /// <summary>Per-generation tolerance growth for derived points.</summary>
+        /// <summary>Baseline tolerance factor for derived (cut) points.</summary>
         public const double GenerationFactor = 8.0;
+
+        /// <summary>
+        /// Upper bound for adaptive tolerance factors. Grazing intersections
+        /// scatter cut points by eps/sin(angle); their tolerance factor is the
+        /// measured conditioning (edge length / height difference), capped
+        /// here. At the default eps this bounds derived-point tolerances to
+        /// ~1e-7 of the scene scale.
+        /// </summary>
+        public const double MaxFactor = 4096.0;
 
         public Eps(double relative, double scene = 0.0)
         {
@@ -64,26 +73,26 @@ namespace Aardvark.Geometry
         /// n·p - d, making the classification invariant under scaling and
         /// translation of the whole scene.
         /// </summary>
-        public Sign3 HeightSign(in Plane3d plane, in V3d p, int generation = 0)
+        public Sign3 HeightSign(in Plane3d plane, in V3d p, double factor = 1.0)
         {
             var h = plane.Normal.Dot(p) - plane.Distance;
             var tol = Relative
                 * (p.X.Abs() + p.Y.Abs() + p.Z.Abs() + plane.Distance.Abs() + Scene)
-                * Gen(generation);
+                * factor;
             return h < -tol ? Sign3.Below : h > tol ? Sign3.Above : Sign3.On;
         }
 
         /// <summary>Coincidence test for two points (max-norm, relative).</summary>
-        public bool AreCoincident(in V3d a, in V3d b, int generation = 0)
+        public bool AreCoincident(in V3d a, in V3d b, double factor = 1.0)
         {
-            var tol = Relative * (a.NormMax + b.NormMax + Scene) * Gen(generation);
+            var tol = Relative * (a.NormMax + b.NormMax + Scene) * factor;
             return (a - b).NormMax <= tol;
         }
 
         /// <summary>2D coincidence test (max-norm, relative, with scene term).</summary>
-        public bool AreCoincident(in V2d a, in V2d b, int generation = 0)
+        public bool AreCoincident(in V2d a, in V2d b, double factor = 1.0)
         {
-            var tol = Relative * (a.NormMax + b.NormMax + Scene) * Gen(generation);
+            var tol = Relative * (a.NormMax + b.NormMax + Scene) * factor;
             return (a - b).NormMax <= tol;
         }
 
@@ -95,7 +104,7 @@ namespace Aardvark.Geometry
         /// determinant (a vertex moving by eps*m changes the area by ~eps*m*L),
         /// keeping the predicate scale- and offset-invariant.
         /// </summary>
-        public Sign3 AreaSign(in V2d a, in V2d b, in V2d c, int generation = 0)
+        public Sign3 AreaSign(in V2d a, in V2d b, in V2d c, double factor = 1.0)
         {
             var d1 = b - a;
             var d2 = c - a;
@@ -103,15 +112,9 @@ namespace Aardvark.Geometry
             var m = Fun.Max(a.X.Abs(), a.Y.Abs(), b.X.Abs(), b.Y.Abs()).Max(
                     Fun.Max(c.X.Abs(), c.Y.Abs()));
             var l = Fun.Max(d1.X.Abs(), d1.Y.Abs(), d2.X.Abs(), d2.Y.Abs());
-            var tol = Relative * (m + l + Scene) * l * Gen(generation);
+            var tol = Relative * (m + l + Scene) * l * factor;
             return det < -tol ? Sign3.Below : det > tol ? Sign3.Above : Sign3.On;
         }
 
-        private static double Gen(int g)
-        {
-            var f = 1.0;
-            for (var i = 0; i < g; i++) f *= GenerationFactor;
-            return f;
-        }
     }
 }

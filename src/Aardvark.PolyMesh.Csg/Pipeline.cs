@@ -53,6 +53,10 @@ namespace Aardvark.Geometry
         private readonly Dictionary<long, int> m_vertexGridHeads = new();
         private readonly List<int> m_vertexGridNext = new();
         private double m_gridH = 1.0;
+        // coarse grid for wide (grazing-conditioned) coincidence radii
+        private readonly Dictionary<long, int> m_coarseHeads = new();
+        private readonly List<int> m_coarseNext = new();
+        private double m_coarseH = 1.0;
 
         private static long CellKey(long x, long y, long z)
         {
@@ -243,6 +247,7 @@ namespace Aardvark.Geometry
             // persistent vertex grid over canonical vertices; sized so that a
             // generation-1 coincidence tolerance still fits one neighbor cell
             m_gridH = (24 * m_eps.Relative * maxMag).Max(1e-300);
+            m_coarseH = (4 * Eps.MaxFactor * m_eps.Relative * maxMag).Max(1e-300);
             for (var i = 0; i < n; i++)
                 if (Canon[i] == i && foreign[m_kernel.VertexMesh[i]].Contains(m_kernel.Positions[i]))
                     GridAdd(i);
@@ -271,23 +276,30 @@ namespace Aardvark.Geometry
             while (m_vertexGridNext.Count <= vid) m_vertexGridNext.Add(-1);
             m_vertexGridNext[vid] = m_vertexGridHeads.TryGetValue(key, out var head) ? head : -1;
             m_vertexGridHeads[key] = vid;
+            var ck = CellKey((long)Fun.Floor(p.X / m_coarseH), (long)Fun.Floor(p.Y / m_coarseH), (long)Fun.Floor(p.Z / m_coarseH));
+            while (m_coarseNext.Count <= vid) m_coarseNext.Add(-1);
+            m_coarseNext[vid] = m_coarseHeads.TryGetValue(ck, out var chead) ? chead : -1;
+            m_coarseHeads[ck] = vid;
         }
 
-        /// <summary>Existing kernel vertex coincident with p (given generation's tolerance), or -1.</summary>
-        private int GridFindCoincident(in V3d p, int generation = 1)
+        /// <summary>Existing kernel vertex coincident with p (given tolerance factor), or -1.</summary>
+        private int GridFindCoincident(in V3d p, double factor = Eps.GenerationFactor)
         {
-            var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
-            for (var g = 0; g < generation; g++) tol *= Eps.GenerationFactor;
-            var cx0 = (long)Fun.Floor((p.X - tol) / m_gridH); var cx1 = (long)Fun.Floor((p.X + tol) / m_gridH);
-            var cy0 = (long)Fun.Floor((p.Y - tol) / m_gridH); var cy1 = (long)Fun.Floor((p.Y + tol) / m_gridH);
-            var cz0 = (long)Fun.Floor((p.Z - tol) / m_gridH); var cz1 = (long)Fun.Floor((p.Z + tol) / m_gridH);
+            var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene) * factor;
+            var fine = factor <= 3 * Eps.GenerationFactor;
+            var h = fine ? m_gridH : m_coarseH;
+            var heads = fine ? m_vertexGridHeads : m_coarseHeads;
+            var next = fine ? m_vertexGridNext : m_coarseNext;
+            var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
+            var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
+            var cz0 = (long)Fun.Floor((p.Z - tol) / h); var cz1 = (long)Fun.Floor((p.Z + tol) / h);
             for (var dx = cx0; dx <= cx1; dx++)
                 for (var dy = cy0; dy <= cy1; dy++)
                     for (var dz = cz0; dz <= cz1; dz++)
                     {
-                        if (!m_vertexGridHeads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
-                        for (; j >= 0; j = m_vertexGridNext[j])
-                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], generation)) return j;
+                        if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
+                        for (; j >= 0; j = next[j])
+                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], factor)) return j;
                     }
             return -1;
         }
@@ -300,7 +312,7 @@ namespace Aardvark.Geometry
         // recomputation is exactly as consistent as memoization, and it makes
         // the parallel narrow phase read-only
         private Sign3 Sign(int planeId, int vid)
-            => m_eps.HeightSign(m_kernel.Planes[planeId], m_kernel.Positions[vid], m_kernel.Generation[vid]);
+            => m_eps.HeightSign(m_kernel.Planes[planeId], m_kernel.Positions[vid], m_kernel.TolFactor[vid]);
 
         #endregion
 
@@ -357,8 +369,9 @@ namespace Aardvark.Geometry
             public readonly int Vid;            // existing vertex, or -1
             public readonly int EdgeA, EdgeB;   // edge to cut (canonical ids) when Vid < 0
             public readonly V3d Pos;
-            public CrossPt(int vid, V3d pos) { Vid = vid; EdgeA = EdgeB = -1; Pos = pos; }
-            public CrossPt(int ea, int eb, V3d pos) { Vid = -1; EdgeA = ea; EdgeB = eb; Pos = pos; }
+            public readonly double Factor;      // adaptive tolerance factor (conditioning of the cut)
+            public CrossPt(int vid, V3d pos, double factor) { Vid = vid; EdgeA = EdgeB = -1; Pos = pos; Factor = factor; }
+            public CrossPt(int ea, int eb, V3d pos, double factor) { Vid = -1; EdgeA = ea; EdgeB = eb; Pos = pos; Factor = factor; }
         }
 
         private enum PairKind : byte { None, Coplanar, Segment }
@@ -403,13 +416,14 @@ namespace Aardvark.Geometry
             var crossB = CrossingPoints(vb, sb, pa);
             if (crossA.Count < 2 || crossB.Count < 2) return default;
 
+
             var dir = m_kernel.Planes[pa].Normal.Cross(m_kernel.Planes[pb].Normal);
             var (loA, hiA) = Interval(crossA, dir);
             var (loB, hiB) = Interval(crossB, dir);
             var (lo, loCutPlane) = loA.T > loB.T ? (loA, pb) : (loB, pa);
             var (hi, hiCutPlane) = hiA.T < hiB.T ? (hiA, pb) : (hiB, pa);
             if (lo.T >= hi.T) return default;
-            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, 1)) return default;
+            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, lo.P.Factor.Max(hi.P.Factor))) return default;
             return new PairResult(lo.P, loCutPlane, hi.P, hiCutPlane);
         }
 
@@ -486,7 +500,7 @@ namespace Aardvark.Geometry
                 {
                     var vi = v[i];
                     if (!result.Exists(c => c.Vid == vi))
-                        result.Add(new CrossPt(vi, m_kernel.Positions[vi]));
+                        result.Add(new CrossPt(vi, m_kernel.Positions[vi], m_kernel.TolFactor[vi]));
                 }
                 var j = (i + 1) % 3;
                 if ((s[i] == Sign3.Above && s[j] == Sign3.Below) || (s[i] == Sign3.Below && s[j] == Sign3.Above))
@@ -497,7 +511,17 @@ namespace Aardvark.Geometry
                     var hi = p.Normal.Dot(pi) - p.Distance;
                     var hj = p.Normal.Dot(pj) - p.Distance;
                     var t = hi / (hi - hj);
-                    result.Add(new CrossPt(v[i], v[j], pi + t * (pj - pi)));
+                    // conditioning: position error along the edge ~ eps·L/|Δh|;
+                    // grazing cuts get a wide (capped) tolerance factor so
+                    // consistency welding still finds them
+                    var l = (pj - pi).NormMax;
+                    // first-order cut position error: L·(|hi|+|hj|)/Δh² times
+                    // the per-coordinate slop — small for endpoint-hugging
+                    // perpendicular cuts, large for genuine grazing
+                    var dh = hi - hj;
+                    var conditioning = (2 * Eps.GenerationFactor * l * (hi.Abs() + hj.Abs()) / (dh * dh))
+                        .Clamp(Eps.GenerationFactor, Eps.MaxFactor);
+                    result.Add(new CrossPt(v[i], v[j], pi + t * (pj - pi), conditioning));
                 }
             }
             return result;
@@ -523,18 +547,18 @@ namespace Aardvark.Geometry
             var key = c.EdgeA < c.EdgeB ? (c.EdgeA, c.EdgeB, cutPlane) : (c.EdgeB, c.EdgeA, cutPlane);
             if (m_cutCache.TryGetValue(key, out var vid)) return vid;
 
-            if (m_eps.AreCoincident(c.Pos, m_kernel.Positions[c.EdgeA], 1)) vid = c.EdgeA;
-            else if (m_eps.AreCoincident(c.Pos, m_kernel.Positions[c.EdgeB], 1)) vid = c.EdgeB;
+            if (m_eps.AreCoincident(c.Pos, m_kernel.Positions[c.EdgeA], c.Factor)) vid = c.EdgeA;
+            else if (m_eps.AreCoincident(c.Pos, m_kernel.Positions[c.EdgeB], c.Factor)) vid = c.EdgeB;
             else
             {
                 // triple-plane corners are reached via several distinct
                 // (edge, plane) cuts: weld onto a coincident existing vertex
-                vid = GridFindCoincident(c.Pos);
+                vid = GridFindCoincident(c.Pos, c.Factor);
                 if (vid < 0)
                 {
                     vid = m_kernel.Positions.Count;
                     m_kernel.Positions.Add(c.Pos);
-                    m_kernel.Generation.Add(1);
+                    m_kernel.TolFactor.Add(c.Factor);
                     GridAdd(vid);
                 }
                 RegisterEdgePoint(c.EdgeA, c.EdgeB, vid);
@@ -581,7 +605,8 @@ namespace Aardvark.Geometry
                         {
                             var j = (i + 1) % 3;
                             if (e == v[i] || e == v[j]) continue;
-                            if (m_eps.AreaSign(p[i], p[j], q, 1) != Sign3.On) continue;
+                            var tjf = Fun.Max(m_kernel.TolFactor[e], Eps.GenerationFactor);
+                            if (m_eps.AreaSign(p[i], p[j], q, tjf) != Sign3.On) continue;
                             var d = p[j] - p[i]; var w = q - p[i];
                             var dot = d.Dot(w);
                             if (dot <= 0 || dot >= d.LengthSquared) continue;
@@ -605,7 +630,16 @@ namespace Aardvark.Geometry
                 var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
                 V2d Proj(int vid) => Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[vid]);
 
-                var cdt = FaceCdt.Rent(m_eps,
+                // face-level adaptive tolerance: the widest factor among the
+                // points this face must integrate (grazing cuts widen it)
+                var faceFactor = Eps.GenerationFactor;
+                if (constraints != null)
+                    foreach (var (ca, cb) in constraints)
+                        faceFactor = faceFactor.Max(m_kernel.TolFactor[ca]).Max(m_kernel.TolFactor[cb]);
+                if (boundary != null)
+                    foreach (var vid in boundary) faceFactor = faceFactor.Max(m_kernel.TolFactor[vid]);
+
+                var cdt = FaceCdt.Rent(m_eps, faceFactor,
                     m_kernel.T0[tri], Proj(m_kernel.T0[tri]),
                     m_kernel.T1[tri], Proj(m_kernel.T1[tri]),
                     m_kernel.T2[tri], Proj(m_kernel.T2[tri]));
@@ -667,7 +701,7 @@ namespace Aardvark.Geometry
             var tri = m_diagTri;
             var msg = $"{e.Message} [tri {tri} mesh {m_kernel.TriMesh[tri]} face {m_kernel.TriFace[tri]} " +
                 $"corners ({m_kernel.T0[tri]}:{m_kernel.Positions[m_kernel.T0[tri]]}, {m_kernel.T1[tri]}:{m_kernel.Positions[m_kernel.T1[tri]]}, {m_kernel.T2[tri]}:{m_kernel.Positions[m_kernel.T2[tri]]})";
-            foreach (var v in vids) msg += $" point {v}:{m_kernel.Positions[v]} gen {m_kernel.Generation[v]}";
+            foreach (var v in vids) msg += $" point {v}:{m_kernel.Positions[v]} f {m_kernel.TolFactor[v]:0.#}";
             return msg + "]";
         }
 
@@ -710,11 +744,14 @@ namespace Aardvark.Geometry
                             if (a == c || a == d || b == c || b == d) continue;
                             var c2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[c]);
                             var d2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[d]);
-                            var sc = m_eps.AreaSign(a2, b2, c2, 1);
-                            var sd = m_eps.AreaSign(a2, b2, d2, 1);
+                            var xf = Fun.Max(
+                                Fun.Max(m_kernel.TolFactor[a], m_kernel.TolFactor[b]),
+                                Fun.Max(m_kernel.TolFactor[c], m_kernel.TolFactor[d])).Max(Eps.GenerationFactor);
+                            var sc = m_eps.AreaSign(a2, b2, c2, xf);
+                            var sd = m_eps.AreaSign(a2, b2, d2, xf);
                             if (!((sc == Sign3.Above && sd == Sign3.Below) || (sc == Sign3.Below && sd == Sign3.Above))) continue;
-                            var sa = m_eps.AreaSign(c2, d2, a2, 1);
-                            var sb = m_eps.AreaSign(c2, d2, b2, 1);
+                            var sa = m_eps.AreaSign(c2, d2, a2, xf);
+                            var sb = m_eps.AreaSign(c2, d2, b2, xf);
                             if (!((sa == Sign3.Above && sb == Sign3.Below) || (sa == Sign3.Below && sb == Sign3.Above))) continue;
 
                             var num = Det(c2 - a2, d2 - c2);
@@ -722,15 +759,16 @@ namespace Aardvark.Geometry
                             if (den == 0.0) continue;
                             var t = num / den;
                             var p = m_kernel.Positions[a] + t.Clamp(0, 1) * (m_kernel.Positions[b] - m_kernel.Positions[a]);
-                            var gen = (byte)(1 + Fun.Max(
-                                m_kernel.Generation[a], m_kernel.Generation[b],
-                                m_kernel.Generation[c], m_kernel.Generation[d]).Max((byte)1));
-                            var vid = GridFindCoincident(p, gen);
+                            var factor = (Eps.GenerationFactor * Fun.Max(
+                                Fun.Max(m_kernel.TolFactor[a], m_kernel.TolFactor[b]),
+                                Fun.Max(m_kernel.TolFactor[c], m_kernel.TolFactor[d])))
+                                .Clamp(Eps.GenerationFactor, Eps.MaxFactor);
+                            var vid = GridFindCoincident(p, factor);
                             if (vid < 0)
                             {
                                 vid = m_kernel.Positions.Count;
                                 m_kernel.Positions.Add(p);
-                                m_kernel.Generation.Add(gen);
+                                m_kernel.TolFactor.Add(factor);
                                 GridAdd(vid);
                             }
                             AddSplit(segs[i], vid);
@@ -756,7 +794,9 @@ namespace Aardvark.Geometry
                     {
                         if (v == a || v == b) continue;
                         var v2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[v]);
-                        if (m_eps.AreaSign(a2, b2, v2, 1) != Sign3.On) continue;
+                        var pf = Fun.Max(Fun.Max(m_kernel.TolFactor[a], m_kernel.TolFactor[b]),
+                            m_kernel.TolFactor[v]).Max(Eps.GenerationFactor);
+                        if (m_eps.AreaSign(a2, b2, v2, pf) != Sign3.On) continue;
                         var t = d2.Dot(v2 - a2);
                         if (t <= 0 || t >= len2) continue;
                         AddSplit(seg, v);
@@ -974,9 +1014,9 @@ namespace Aardvark.Geometry
             t[2] = Triangulator.ProjectDominant(n, m_kernel.Positions[m_kernel.T2[partner]]);
             if (!MakeCcw(t)) return false;
             var q = Triangulator.ProjectDominant(n, p);
-            return m_eps.AreaSign(t[0], t[1], q, 1) != Sign3.Below
-                && m_eps.AreaSign(t[1], t[2], q, 1) != Sign3.Below
-                && m_eps.AreaSign(t[2], t[0], q, 1) != Sign3.Below;
+            return m_eps.AreaSign(t[0], t[1], q, Eps.GenerationFactor) != Sign3.Below
+                && m_eps.AreaSign(t[1], t[2], q, Eps.GenerationFactor) != Sign3.Below
+                && m_eps.AreaSign(t[2], t[0], q, Eps.GenerationFactor) != Sign3.Below;
         }
 
         private bool RegionIsInsideOther(List<int> region, int otherMesh)
@@ -1007,21 +1047,21 @@ namespace Aardvark.Geometry
                 var h = plane.Normal.Dot(o) - plane.Distance;
                 if (denom.Abs() < 1e-9)
                 {
-                    if (m_eps.HeightSign(plane, o, 1) == Sign3.On) return null; // ray (nearly) in plane near origin
+                    if (m_eps.HeightSign(plane, o, Eps.GenerationFactor) == Sign3.On) return null; // ray (nearly) in plane near origin
                     continue;
                 }
                 var s = -h / denom;
                 if (s <= 0) continue;
                 var hit = o + s * dir;
-                if (m_eps.AreCoincident(hit, o, 1)) return null; // origin on the other surface
+                if (m_eps.AreCoincident(hit, o, Eps.GenerationFactor)) return null; // origin on the other surface
 
                 var p0 = Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[m_kernel.T0[t]]);
                 var p1 = Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[m_kernel.T1[t]]);
                 var p2 = Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[m_kernel.T2[t]]);
                 var q = Triangulator.ProjectDominant(plane.Normal, hit);
-                var s0 = m_eps.AreaSign(p0, p1, q, 1);
-                var s1 = m_eps.AreaSign(p1, p2, q, 1);
-                var s2 = m_eps.AreaSign(p2, p0, q, 1);
+                var s0 = m_eps.AreaSign(p0, p1, q, Eps.GenerationFactor);
+                var s1 = m_eps.AreaSign(p1, p2, q, Eps.GenerationFactor);
+                var s2 = m_eps.AreaSign(p2, p0, q, Eps.GenerationFactor);
                 if (s0 == Sign3.Below || s1 == Sign3.Below || s2 == Sign3.Below) continue; // outside triangle
                 if (s0 == Sign3.On || s1 == Sign3.On || s2 == Sign3.On) return null;       // grazing edge/vertex
                 count++;

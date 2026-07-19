@@ -17,7 +17,8 @@ namespace Aardvark.Geometry
 
         // vertices
         public readonly List<V3d> Positions = new();
-        public readonly List<byte> Generation = new();
+        /// <summary>per-vertex tolerance factor: 1 for input vertices, conditioning-derived for cuts</summary>
+        public readonly List<double> TolFactor = new();
 
         // triangles (SoA, parallel lists)
         public readonly List<int> T0 = new(), T1 = new(), T2 = new();
@@ -85,7 +86,7 @@ namespace Aardvark.Geometry
             for (var i = 0; i < pos.Length; i++)
             {
                 Positions.Add(pos[i]);
-                Generation.Add(0);
+                TolFactor.Add(1.0);
                 VertexMesh.Add(meshIndex);
                 bounds.ExtendBy(pos[i]);
                 maxMag = maxMag.Max(pos[i].NormMax);
@@ -163,7 +164,7 @@ namespace Aardvark.Geometry
             var triCount = solid.T0.Length;
             if (Positions.Capacity < Positions.Count + pos.Length + pos.Length / 8)
                 Positions.Capacity = Positions.Count + pos.Length + pos.Length / 8;
-            if (Generation.Capacity < Positions.Capacity) Generation.Capacity = Positions.Capacity;
+            if (TolFactor.Capacity < Positions.Capacity) TolFactor.Capacity = Positions.Capacity;
             if (VertexMesh.Capacity < Positions.Capacity) VertexMesh.Capacity = Positions.Capacity;
             if (T0.Capacity < T0.Count + triCount)
             {
@@ -176,10 +177,10 @@ namespace Aardvark.Geometry
             var vOld = Positions.Count;
             var vNew = vOld + pos.Length;
             System.Runtime.InteropServices.CollectionsMarshal.SetCount(Positions, vNew);
-            System.Runtime.InteropServices.CollectionsMarshal.SetCount(Generation, vNew);
+            System.Runtime.InteropServices.CollectionsMarshal.SetCount(TolFactor, vNew);
             System.Runtime.InteropServices.CollectionsMarshal.SetCount(VertexMesh, vNew);
             var posSpan = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(Positions).Slice(vOld);
-            System.Runtime.InteropServices.CollectionsMarshal.AsSpan(Generation).Slice(vOld).Clear();
+            System.Runtime.InteropServices.CollectionsMarshal.AsSpan(TolFactor).Slice(vOld).Fill(1.0);
             System.Runtime.InteropServices.CollectionsMarshal.AsSpan(VertexMesh).Slice(vOld).Fill(meshIndex);
             if (solid.HasTrafo)
             {

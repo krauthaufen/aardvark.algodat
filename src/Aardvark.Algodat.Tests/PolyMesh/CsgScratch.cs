@@ -102,7 +102,7 @@ namespace Aardvark.Geometry.Tests
                     Console.WriteLine($"frag {f}: mesh {kernel.TriMesh[fr.Parent]} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) c ({ce.X:0.########},{ce.Y:0.###},{ce.Z:0.###}) {pipe.Label(f, 1 - kernel.TriMesh[fr.Parent])}");
                 }
                 for (var vi = 0; vi < kernel.Positions.Count; vi++)
-                    Console.WriteLine($"vert {vi}: ({kernel.Positions[vi].X:0.#########},{kernel.Positions[vi].Y:0.#########},{kernel.Positions[vi].Z:0.#########}) gen {kernel.Generation[vi]}");
+                    Console.WriteLine($"vert {vi}: ({kernel.Positions[vi].X:0.#########},{kernel.Positions[vi].Y:0.#########},{kernel.Positions[vi].Z:0.#########}) f {kernel.TolFactor[vi]:0.#}");
                 // union selection: Outside everywhere + OnSame from mesh 0
                 var kept = new System.Collections.Generic.List<int>();
                 for (var f = 0; f < pipe.Fragments.Count; f++)
