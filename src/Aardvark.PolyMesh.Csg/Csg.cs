@@ -60,6 +60,15 @@ namespace Aardvark.Geometry
         public static PolyMesh[] Xor(PolyMesh a, PolyMesh b, CsgOptions? options = null)
             => CsgArrangement.Arrange(a, b, options).Xor();
 
+        /// <summary>
+        /// Resolves self-intersections of a single closed manifold into the
+        /// boundary of its positive-winding region (self-overlaps counted
+        /// once). One PolyMesh per component. Combine with PolyMeshRepair for a
+        /// full sanitize of arbitrary input.
+        /// </summary>
+        public static PolyMesh[] ResolveSelfIntersections(PolyMesh mesh, CsgOptions? options = null)
+            => CsgArrangement.ResolveSelfIntersections(mesh, options);
+
         /// <summary>N-ary union in a single arrangement (one kernel, one subdivision — cheaper than a pairwise cascade).</summary>
         public static PolyMesh[] Union(PolyMesh[] solids, CsgOptions? options = null)
             => solids.Length == 1 ? new[] { solids[0] } : CsgArrangement.Arrange(solids, options).Union();

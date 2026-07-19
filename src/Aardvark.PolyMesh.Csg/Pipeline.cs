@@ -83,9 +83,10 @@ namespace Aardvark.Geometry
 
         private readonly int m_maxThreads;
 
-        public Pipeline(Kernel kernel, CsgMesh?[]? prepared = null, int maxThreads = 1)
+        public Pipeline(Kernel kernel, CsgMesh?[]? prepared = null, int maxThreads = 1, bool selfResolve = false)
         {
             m_maxThreads = maxThreads.Max(1);
+            m_selfResolve = selfResolve;
             kernel.UpdateSceneScale();
             m_kernel = kernel;
             m_eps = kernel.Eps;
@@ -93,6 +94,20 @@ namespace Aardvark.Geometry
             m_barriers = new HashSet<long>[kernel.MeshCount]
                 .SetByIndex(_ => new HashSet<long>(MixedLongComparer.Instance));
         }
+
+        /// <summary>
+        /// Self-resolution mode: instead of classifying fragments against other
+        /// meshes, the single ingested mesh is arranged against ITSELF and the
+        /// boundary of its positive-winding region is selected. Fills
+        /// <see cref="SelfKeep"/> / <see cref="SelfFlip"/> in place of the
+        /// cross-mesh label table.
+        /// </summary>
+        private readonly bool m_selfResolve;
+
+        /// <summary>self-resolve: whether each fragment is on the union (winding≥1) boundary.</summary>
+        public bool[] SelfKeep = Array.Empty<bool>();
+        /// <summary>self-resolve: whether the kept fragment's winding is reversed relative to its parent.</summary>
+        public bool[] SelfFlip = Array.Empty<bool>();
 
         private static readonly string? s_debugFace = Environment.GetEnvironmentVariable("CSG_DEBUG_FACE");
         private System.Diagnostics.Stopwatch? m_perfSw;
@@ -132,7 +147,7 @@ namespace Aardvark.Geometry
             Lap("narrowphase");
             Subdivide();
             Lap($"subdivide ({Fragments.Count} fragments)");
-            Classify();
+            if (m_selfResolve) SelfClassify(); else Classify();
             Lap("classify");
         }
 
@@ -525,6 +540,24 @@ namespace Aardvark.Geometry
                         pairs.Add((ti[x], tj[y]));
                     });
                 }
+            if (m_selfResolve)
+            {
+                // intra-mesh pairs for self-intersection: unordered, and skip
+                // topologically adjacent triangles (sharing a welded vertex),
+                // which merely meet along a shared edge and never self-cross
+                var seen = new HashSet<long>(MixedLongComparer.Instance);
+                for (var m = 0; m < n; m++)
+                {
+                    var tm = m_triOf[m];
+                    m_bvh[m].ForEachIntersectingPair(m_bvh[m], (x, y) =>
+                    {
+                        var a = tm[x]; var b = tm[y];
+                        if (a >= b) return;
+                        if (ShareVertex(a, b)) return;
+                        if (seen.Add(((long)a << 32) | (uint)b)) pairs.Add((a, b));
+                    });
+                }
+            }
             if (Environment.GetEnvironmentVariable("CSG_BRUTE") != null)
             {
                 Box3d TriBox(int t) => new Box3d(
@@ -544,6 +577,13 @@ namespace Aardvark.Geometry
                 Console.WriteLine($"BRUTE {missing} missing of {pairs.Count} found");
             }
             return pairs;
+        }
+
+        private bool ShareVertex(int a, int b)
+        {
+            int a0 = m_kernel.T0[a], a1 = m_kernel.T1[a], a2 = m_kernel.T2[a];
+            int b0 = m_kernel.T0[b], b1 = m_kernel.T1[b], b2 = m_kernel.T2[b];
+            return a0 == b0 || a0 == b1 || a0 == b2 || a1 == b0 || a1 == b1 || a1 == b2 || a2 == b0 || a2 == b1 || a2 == b2;
         }
 
         #endregion
@@ -1747,6 +1787,93 @@ namespace Aardvark.Geometry
             new V3d(0.9191, 0.1919, 0.3468), new V3d(-0.7373, -0.1717, 0.6534),
             new V3d(0.3737, 0.6161, -0.6935), new V3d(-0.1818, -0.8888, 0.4207),
         }.Map(v => v.Normalized);
+
+        /// <summary>
+        /// Self-resolution classification: each fragment is a piece of the
+        /// (possibly self-intersecting) input surface. The resolved solid is
+        /// the positive-winding region {w ≥ 1}; a fragment lies on its boundary
+        /// iff its two sides straddle winding 1. The winding number at a point
+        /// is the signed count of surface crossings of a ray to infinity
+        /// (+1 inside a single outward-oriented shell, 0 outside).
+        /// </summary>
+        private void SelfClassify()
+        {
+            SelfKeep = new bool[Fragments.Count];
+            SelfFlip = new bool[Fragments.Count];
+            var diag = m_bvh[0].RootBox.Size.Length;
+            CsgParallel.For(0, Fragments.Count, m_maxThreads, f =>
+            {
+                var fr = Fragments[f];
+                var p0 = m_kernel.Positions[fr.V0]; var p1 = m_kernel.Positions[fr.V1]; var p2 = m_kernel.Positions[fr.V2];
+                var c = (p0 + p1 + p2) / 3.0;
+                var nrm = (p1 - p0).Cross(p2 - p0);
+                var len = nrm.Length;
+                if (len <= 0) return; // degenerate fragment
+                nrm /= len;
+                var edge = Fun.Min((p1 - p0).Length, (p2 - p1).Length, (p0 - p2).Length);
+                // sample winding on both sides; the correct offset lands one in
+                // each adjacent cell, so the windings must differ by exactly 1
+                // (crossing one sheet). At crowded triple lines a too-large
+                // offset crosses an extra sheet — shrink until the invariant
+                // holds; a too-small offset stays in one cell (diff 0) — grow.
+                var wMinus = 0; var wPlus = 0; var ok = false;
+                var eps = (1e-2 * edge).Max(1e-9 * diag);
+                for (var attempt = 0; attempt < 20 && eps > 1e-13 * diag; attempt++)
+                {
+                    var wm = WindingAt(c - eps * nrm);
+                    var wp = WindingAt(c + eps * nrm);
+                    if (wm == null || wp == null) { eps *= 0.5; continue; }
+                    var d = wm.Value - wp.Value;
+                    if (d == 1 || d == -1) { wMinus = wm.Value; wPlus = wp.Value; ok = true; break; }
+                    eps *= d == 0 ? 4.0 : 0.5;
+                }
+                if (!ok) return; // could not isolate the two adjacent cells → drop
+                var inMinus = wMinus >= 1;
+                var inPlus = wPlus >= 1;
+                if (inMinus == inPlus) return; // interior or exterior fragment → not on the boundary
+                SelfKeep[f] = true;
+                SelfFlip[f] = inPlus; // normal points into the solid → reverse it outward
+            });
+        }
+
+        /// <summary>
+        /// Winding number of p against the original surface: signed count of
+        /// forward ray crossings, +1 per exit and −1 per entry. Returns null
+        /// when every probe direction grazes the surface at p.
+        /// </summary>
+        private int? WindingAt(in V3d p)
+        {
+            foreach (var dir in s_rayDirs)
+            {
+                var w = 0; var grazed = false;
+                foreach (var t in m_bvh[0].RayCandidates(p, dir, m_triOf[0]))
+                {
+                    var q0 = m_kernel.Positions[m_kernel.T0[t]];
+                    var q1 = m_kernel.Positions[m_kernel.T1[t]];
+                    var q2 = m_kernel.Positions[m_kernel.T2[t]];
+                    var nrm = (q1 - q0).Cross(q2 - q0);
+                    var denom = nrm.Dot(dir);
+                    if (denom.Abs() < 1e-300) continue; // ray parallel to the face
+                    var s = nrm.Dot(q0 - p) / denom;
+                    if (s <= 1e-12) continue; // behind or through the origin
+                    var hit = p + s * dir;
+                    var a = Triangulator.ProjectDominant(nrm, q0);
+                    var b = Triangulator.ProjectDominant(nrm, q1);
+                    var cc = Triangulator.ProjectDominant(nrm, q2);
+                    var h = Triangulator.ProjectDominant(nrm, hit);
+                    var s0 = m_eps.AreaSign(a, b, h, Eps.GenerationFactor);
+                    var s1 = m_eps.AreaSign(b, cc, h, Eps.GenerationFactor);
+                    var s2 = m_eps.AreaSign(cc, a, h, Eps.GenerationFactor);
+                    if (s0 == Sign3.On || s1 == Sign3.On || s2 == Sign3.On) { grazed = true; break; }
+                    var inside = (s0 != Sign3.Below && s1 != Sign3.Below && s2 != Sign3.Below)
+                              || (s0 != Sign3.Above && s1 != Sign3.Above && s2 != Sign3.Above);
+                    if (!inside) continue;
+                    w += denom > 0 ? 1 : -1;
+                }
+                if (!grazed) return w;
+            }
+            return null;
+        }
 
         private void Classify()
         {

@@ -46,6 +46,47 @@ namespace Aardvark.Geometry
     /// </summary>
     public static class PolyMeshRepair
     {
+        /// <summary>
+        /// Full sanitize: topological <see cref="Repair"/> followed by
+        /// geometric self-intersection resolution (the union of everything the
+        /// surface encloses). If resolution hits a degeneracy it cannot yet
+        /// handle (coincident coplanar self-overlap), the topologically-clean
+        /// repair is returned instead, so the result is always valid manifolds.
+        /// </summary>
+        public static PolyMesh[] Sanitize(PolyMesh mesh, RepairOptions? options = null)
+        {
+            var repaired = Repair(mesh, options);
+            if (repaired.Length == 0) return repaired;
+            var soup = Combine(repaired);
+            try { return CsgArrangement.ResolveSelfIntersections(soup); }
+            catch (CsgVerificationException) { return repaired; } // resolution degeneracy → keep the topological repair
+            catch (CsgInputException) { return repaired; }
+        }
+
+        /// <summary>Concatenates several meshes into one triangle soup (positions offset per mesh).</summary>
+        private static PolyMesh Combine(PolyMesh[] meshes)
+        {
+            var pos = new List<V3d>();
+            var via = new List<int>();
+            foreach (var m in meshes)
+            {
+                var off = pos.Count;
+                pos.AddRange(m.PositionArray);
+                var fia = m.FirstIndexArray; var mv = m.VertexIndexArray;
+                for (var fi = 0; fi + 1 < fia.Length; fi++)
+                {
+                    var s = fia[fi]; var e = fia[fi + 1];
+                    for (var i = s + 1; i + 1 < e; i++) { via.Add(mv[s] + off); via.Add(mv[i] + off); via.Add(mv[i + 1] + off); }
+                }
+            }
+            return new PolyMesh
+            {
+                PositionArray = pos.ToArray(),
+                FirstIndexArray = new int[via.Count / 3 + 1].SetByIndex(i => i * 3),
+                VertexIndexArray = via.ToArray(),
+            };
+        }
+
         public static PolyMesh[] Repair(PolyMesh mesh, RepairOptions? options = null)
         {
             var o = options ?? RepairOptions.Default;

@@ -71,6 +71,31 @@ namespace Aardvark.Geometry
             return new CsgArrangement(kernel, pipeline, solids, o);
         }
 
+        /// <summary>
+        /// Resolves a single (possibly self-intersecting) closed manifold into
+        /// the boundary of its positive-winding region — the solid the surface
+        /// describes with self-overlaps counted once. Emitted as one PolyMesh
+        /// per component. The input must be a combinatorial closed manifold
+        /// (it may self-intersect geometrically); run PolyMeshRepair first if
+        /// it is not.
+        /// </summary>
+        public static PolyMesh[] ResolveSelfIntersections(PolyMesh mesh, CsgOptions? options = null)
+        {
+            var o = options ?? CsgOptions.Default;
+            if (o.Verification != CsgVerification.None)
+            {
+                var v = ManifoldChecks.FindManifoldViolation(mesh.FirstIndexArray, mesh.VertexIndexArray, mesh.PositionArray.Length);
+                if (v != null) throw new CsgInputException($"input mesh is not a closed manifold: {v}");
+            }
+            var kernel = new Kernel(new Eps(o.RelativeEpsilon));
+            kernel.Ingest(mesh, 0, verify: false);
+            var pipeline = new Pipeline(kernel, maxThreads: o.MaxThreads, selfResolve: true);
+            pipeline.Run();
+            var arr = new CsgArrangement(kernel, pipeline, new[] { mesh }, o);
+            return arr.Emit((_, f) =>
+                pipeline.SelfKeep[f] ? (pipeline.SelfFlip[f] ? Selection.Flip : Selection.Keep) : Selection.Drop);
+        }
+
         public static CsgArrangement Arrange(CsgMesh a, CsgMesh b, CsgOptions? options = null)
             => Arrange(new[] { a, b }, options);
 
