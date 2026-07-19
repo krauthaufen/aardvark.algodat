@@ -40,9 +40,10 @@ namespace Aardvark.Geometry.Tests
             };
         }
 
-        private static Case[] Load()
+        private static Case[] Load(string name)
         {
-            var path = Path.Combine(TestContext.CurrentContext.TestDirectory, "PolyMesh", "manifold-cases.json.gz");
+            var path = Path.Combine(TestContext.CurrentContext.TestDirectory, "PolyMesh", name);
+            if (!File.Exists(path)) return Array.Empty<Case>();
             using var stream = new GZipStream(File.OpenRead(path), CompressionMode.Decompress);
             var file = JsonSerializer.Deserialize<CaseFile>(stream,
                 new JsonSerializerOptions { PropertyNameCaseInsensitive = true })!;
@@ -52,8 +53,28 @@ namespace Aardvark.Geometry.Tests
         [Test]
         public void ReplayManifoldCases()
         {
-            var cases = Load();
+            var cases = Load("manifold-cases.json.gz");
             Assert.That(cases.Length, Is.GreaterThan(20));
+            Replay(cases);
+        }
+
+        /// <summary>
+        /// External real-world meshes (CGAL data collection, libigl models) in
+        /// nasty configurations — generated locally by
+        /// tools/csg-gen-external-cases.py (external data licenses keep the
+        /// fixture out of the repo); skipped when absent.
+        /// </summary>
+        [Test]
+        public void ReplayExternalCases()
+        {
+            var cases = Load("external-cases.json.gz");
+            if (cases.Length == 0)
+                Assert.Ignore("external-cases.json.gz not present (run tools/csg-gen-external-cases.py)");
+            Replay(cases);
+        }
+
+        private static void Replay(Case[] cases)
+        {
             var failures = 0;
             foreach (var c in cases)
             {

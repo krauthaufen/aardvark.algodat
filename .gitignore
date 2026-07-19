@@ -29,3 +29,4 @@ obj/
 .ionide
 .boss
 /.claude/settings.local.json
+src/Aardvark.Algodat.Tests/PolyMesh/external-cases.json.gz
