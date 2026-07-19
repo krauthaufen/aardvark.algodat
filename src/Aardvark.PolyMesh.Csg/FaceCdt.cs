@@ -25,6 +25,7 @@ namespace Aardvark.Geometry
         private double m_aliasTol;
         private readonly List<int> m_kernelIds = new();
         private readonly List<V2d> m_pos = new();
+        private readonly List<int> m_chainMask = new(); // boundary-chain membership bits
         private readonly Dictionary<int, int> m_localOfKernel = new();
 
         // triangle soup (parallel lists), dead triangles flagged
@@ -59,6 +60,7 @@ namespace Aardvark.Geometry
         {
             m_kernelIds.Clear();
             m_pos.Clear();
+            m_chainMask.Clear();
             m_localOfKernel.Clear();
             m_t0.Clear(); m_t1.Clear(); m_t2.Clear();
             m_dead.Clear();
@@ -73,6 +75,7 @@ namespace Aardvark.Geometry
             var ext = Fun.Max((p1 - p0).NormMax, (p2 - p0).NormMax, (p2 - p1).NormMax);
             m_aliasTol = 4 * m_eps.Relative * (mag + ext + m_eps.Scene) * m_factor;
             AddPointRaw(k0, p0); AddPointRaw(k1, p1); AddPointRaw(k2, p2);
+            m_chainMask[0] = 0b101; m_chainMask[1] = 0b011; m_chainMask[2] = 0b110;
             if (Area(p0, p1, p2) != Sign3.Above)
                 throw new CsgVerificationException("face is not counter-clockwise in its plane projection");
             AddTri(0, 1, 2);
@@ -83,6 +86,7 @@ namespace Aardvark.Geometry
             var li = m_kernelIds.Count;
             m_kernelIds.Add(kernelId);
             m_pos.Add(p);
+            m_chainMask.Add(0);
             m_localOfKernel[kernelId] = li;
             return li;
         }
@@ -134,10 +138,26 @@ namespace Aardvark.Geometry
                     return corner;
                 }
                 var li = AddPointRaw(kernelId, p);
+                if (Environment.GetEnvironmentVariable("CSG_DEBUG_SLIVER") != null)
+                    Console.WriteLine($"  INSERT kernel {kernelId} tri ({m_kernelIds[a]},{m_kernelIds[b]},{m_kernelIds[c]}) dets {d0:E2},{d1:E2},{d2:E2} zeros {zeros}");
                 if (zeros == 1)
                 {
                     var (u, v) = z0 ? (a, b) : z1 ? (b, c) : (c, a);
-                    SplitEdgeRaw(u, v, li);
+                    if (FindTriWithEdge(v, u) >= 0 || Environment.GetEnvironmentVariable("CSG_OLD_INSERT") != null)
+                    {
+                        SplitEdgeRaw(u, v, li);
+                    }
+                    else
+                    {
+                        // exactly on a BOUNDARY edge (outline lerps are
+                        // bit-collinear with it): splitting would subdivide
+                        // the shared chain invisibly to the neighbor face —
+                        // nudge inside and split the triangle instead
+                        var mid = (m_pos[a] + m_pos[b] + m_pos[c]) / 3.0;
+                        m_pos[li] = p + 1e-9 * (mid - p);
+                        m_dead[t] = true;
+                        AddTri(a, b, li); AddTri(b, c, li); AddTri(c, a, li);
+                    }
                 }
                 else
                 {
@@ -171,6 +191,8 @@ namespace Aardvark.Geometry
                 }
             }
             if (bTri < 0) throw new CsgVerificationException("point to insert lies outside the face");
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_SLIVER") != null)
+                Console.WriteLine($"  FALLBACK kernel {kernelId} tri {bTri}");
             var (ba, bb, bc) = Tri(bTri);
             var centroid = (m_pos[ba] + m_pos[bb] + m_pos[bc]) / 3.0;
             var inside = bProj + 1e-9 * (centroid - bProj);
@@ -200,7 +222,7 @@ namespace Aardvark.Geometry
                 m_localOfKernel[kernelId] = m_localOfKernel[kernelTarget];
         }
 
-        public int InsertOnEdge(int prevKernel, int endKernel, int kernelId, V2d p)
+        public int InsertOnEdge(int prevKernel, int endKernel, int kernelId, V2d p, int chainBit)
         {
             if (m_localOfKernel.TryGetValue(kernelId, out var known)) return known;
             var a = m_localOfKernel[prevKernel];
@@ -210,6 +232,7 @@ namespace Aardvark.Geometry
             if (FindTriWithEdge(a, b) < 0 && FindTriWithEdge(b, a) < 0)
                 throw new CsgVerificationException("boundary chain edge missing during edge subdivision");
             var li = AddPointRaw(kernelId, p);
+            m_chainMask[li] = chainBit;
             SplitEdgeRaw(a, b, li);
             LegalizeAround(li);
             return li;
@@ -454,7 +477,14 @@ namespace Aardvark.Geometry
         public (List<(int, int, int)> Triangles, List<(int, int)> ConstraintEdges) Triangulate()
         {
             foreach (var (a, b) in m_constraints) EnforceConstraint(a, b);
+            if (Environment.GetEnvironmentVariable("CSG_NO_CHAINFLIP") == null) RemoveChainSlivers();
 
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_SLIVER") != null)
+            {
+                var live = 0;
+                for (var t = 0; t < m_t0.Count; t++) if (!m_dead[t]) live++;
+                Console.WriteLine($"  EMIT {m_pos.Count} pts {live} live of {m_t0.Count}");
+            }
             var tris = new List<(int, int, int)>();
             var area = 0.0;
             for (var t = 0; t < m_t0.Count; t++)
@@ -480,6 +510,59 @@ namespace Aardvark.Geometry
                 .Select(e => (m_kernelIds[e.Item1], m_kernelIds[e.Item2]))
                 .ToList();
             return (tris, constraintEdges);
+        }
+
+        /// <summary>
+        /// A triangle whose three vertices lie on the same boundary chain is
+        /// a sub-resolution artifact: the chain is eps-collinear by
+        /// commitment, and raw scatter can wind such a sliver CCW in BOTH
+        /// faces sharing the edge, producing same-direction halfedges that
+        /// can never pair. Flipping the sliver's interior diagonal removes it.
+        /// </summary>
+        private void RemoveChainSlivers()
+        {
+            static double Det(in V2d a, in V2d b, in V2d c)
+                => (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
+            for (var guard = 0; guard < 1000; guard++)
+            {
+                var flipped = false;
+                for (var t = 0; t < m_t0.Count && !flipped; t++)
+                {
+                    if (m_dead[t]) continue;
+                    var (a, b, c) = Tri(t);
+                    if ((m_chainMask[a] & m_chainMask[b] & m_chainMask[c]) == 0) continue;
+                    Span<int> e = stackalloc int[] { a, b, b, c, c, a };
+                    for (var i = 0; i < 3 && !flipped; i++)
+                    {
+                        var u = e[i * 2]; var v = e[i * 2 + 1];
+                        if (m_constrained.Contains(Key(u, v))) continue;
+                        var nt = FindTriWithEdge(v, u);
+                        if (nt < 0) continue;
+                        var w = ThirdVertex(nt, v, u);
+                        var z = ThirdVertex(t, u, v);
+                        // flip only into a raw-valid pair
+                        if (Det(m_pos[u], m_pos[w], m_pos[z]) <= 0) continue;
+                        if (Det(m_pos[w], m_pos[v], m_pos[z]) <= 0) continue;
+                        m_dead[t] = true; m_dead[nt] = true;
+                        AddTri(u, w, z); AddTri(w, v, z);
+                        flipped = true;
+                    }
+                }
+                if (!flipped)
+                {
+                    if (Environment.GetEnvironmentVariable("CSG_DEBUG_SLIVER") != null)
+                        for (var t = 0; t < m_t0.Count; t++)
+                        {
+                            if (m_dead[t]) continue;
+                            var (a, b, c) = Tri(t);
+                            if ((m_chainMask[a] & m_chainMask[b] & m_chainMask[c]) == 0) continue;
+                            Console.WriteLine($"SLIVER stuck: kernels {m_kernelIds[a]},{m_kernelIds[b]},{m_kernelIds[c]} " +
+                                $"masks {m_chainMask[a]},{m_chainMask[b]},{m_chainMask[c]} " +
+                                $"con {m_constrained.Contains(Key(a, b))},{m_constrained.Contains(Key(b, c))},{m_constrained.Contains(Key(c, a))}");
+                        }
+                    return;
+                }
+            }
         }
     }
 }

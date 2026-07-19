@@ -383,9 +383,12 @@ namespace Aardvark.Geometry.Tests
                 {
                     try
                     {
-                        var arr = CsgArrangement.Arrange(a, b, new CsgOptions { MaxThreads = 1 });
-                        op(arr);
-                        Console.WriteLine($"{opName} ok");
+                        var arr = CsgArrangement.Arrange(a, b, new CsgOptions
+                        {
+                            MaxThreads = int.TryParse(Environment.GetEnvironmentVariable("CSG_THREADS"), out var mt) ? mt : 1,
+                        });
+                        var outMeshes = op(arr);
+                        Console.WriteLine($"{opName} ok vol {outMeshes.Sum(CsgM0Tests.Volume):0.######} parts {outMeshes.Length}");
                     }
                     catch (Exception ex) { Console.WriteLine($"{opName} FAIL: {ex.Message}"); }
                 }

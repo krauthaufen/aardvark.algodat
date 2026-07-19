@@ -222,6 +222,57 @@ namespace Aardvark.Geometry
                     default: throw new InvalidOperationException();
                 }
             }
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_LABELS") != null)
+            {
+                var hist = new Dictionary<(int Mesh, FragLabel L), int>();
+                for (var f = 0; f < m_pipeline.Fragments.Count; f++)
+                {
+                    var mesh = m_kernel.TriMesh[m_pipeline.Fragments[f].Parent];
+                    for (var m = 0; m < m_kernel.MeshCount; m++)
+                        if (m != mesh)
+                        {
+                            var key = (mesh, m_pipeline.Label(f, m));
+                            hist[key] = (hist.TryGetValue(key, out var c) ? c : 0) + 1;
+                        }
+                }
+                foreach (var (k, v) in hist.OrderBy(kv => kv.Key))
+                    Console.WriteLine($"LABELS mesh {k.Mesh} {k.L}: {v}");
+            }
+            var dbgFace = Environment.GetEnvironmentVariable("CSG_DEBUG_FRAGFACE");
+            if (dbgFace != null)
+            {
+                var want = int.Parse(dbgFace);
+                for (var f = 0; f < m_pipeline.Fragments.Count; f++)
+                {
+                    var frag = m_pipeline.Fragments[f];
+                    if (frag.Parent != want) continue;
+                    var mesh = m_kernel.TriMesh[frag.Parent];
+                    var labels = "";
+                    for (var m = 0; m < m_kernel.MeshCount; m++)
+                        if (m != mesh) labels += $" L{m}={m_pipeline.Label(f, m)}";
+                    Console.WriteLine($"FACEFRAG {f}: corners {frag.V0},{frag.V1},{frag.V2}{labels} sel {select(mesh, f)}");
+                }
+            }
+            var dbgEdge = Environment.GetEnvironmentVariable("CSG_DEBUG_EDGE");
+            if (dbgEdge != null)
+            {
+                var parts = dbgEdge.Split(',');
+                var ku = int.Parse(parts[0]); var kv = int.Parse(parts[1]);
+                for (var f = 0; f < m_pipeline.Fragments.Count; f++)
+                {
+                    var frag = m_pipeline.Fragments[f];
+                    Span<int> vs = stackalloc int[] { frag.V0, frag.V1, frag.V2 };
+                    var hu = false; var hv = false;
+                    foreach (var v in vs) { hu |= v == ku; hv |= v == kv; }
+                    if (!hu || !hv) continue;
+                    var mesh = m_kernel.TriMesh[frag.Parent];
+                    var labels = "";
+                    for (var m = 0; m < m_kernel.MeshCount; m++)
+                        if (m != mesh) labels += $" L{m}={m_pipeline.Label(f, m)}";
+                    Console.WriteLine($"EDGEFRAG {f}: parent {frag.Parent} mesh {mesh} face {m_kernel.TriFace[frag.Parent]} " +
+                        $"corners {frag.V0},{frag.V1},{frag.V2}{labels} sel {select(mesh, f)}");
+                }
+            }
             var solids = Emitter.Emit(m_kernel, tris, m_sources,
                 m_options.Verification == CsgVerification.Full, m_options.MaxThreads);
             m_lastSolids = solids;

@@ -72,7 +72,7 @@ namespace Aardvark.Geometry
         private readonly Dictionary<(int, int), HashSet<int>> m_edgePoints = new(); // canonical edge -> points on it
         private readonly Dictionary<int, HashSet<(int, int)>> m_faceConstraints = new(); // kernel tri -> segments
         private HashSet<long>[] m_barriers = Array.Empty<HashSet<long>>(); // per mesh: constraint sub-edges (packed keys)
-        private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
+        private readonly Dictionary<int, List<(int Partner, bool Same, double Factor)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
         private CsgBvh[] m_bvh = Array.Empty<CsgBvh>();
         private int[][] m_triOf = Array.Empty<int[]>();
         private int[] m_adjNbr = Array.Empty<int>();
@@ -469,7 +469,14 @@ namespace Aardvark.Geometry
             var n = m_kernel.MeshCount;
             m_bvh = new CsgBvh[n];
             m_triOf = new int[n][];
-            var slackScene = 8 * m_eps.Relative * (m_eps.Scene + 1e-300);
+            // the broad phase must be conservative against the WIDEST
+            // tolerance any later pass can apply (adaptive factors reach
+            // MaxFactor): grazing twin faces separated by less than the
+            // MaxFactor coincidence radius still interact — with a smaller
+            // slack, axis-planar twins (zero box extent) are never paired,
+            // so coplanar sheets go unregistered and selection cracks
+            var slackScene = (Environment.GetEnvironmentVariable("CSG_OLD_SLACK") != null ? 8.0 : 4 * Eps.MaxFactor)
+                * m_eps.Relative * (m_eps.Scene + 1e-300);
             for (var m = 0; m < n; m++)
             {
                 var list = new List<int>();
@@ -495,14 +502,48 @@ namespace Aardvark.Geometry
                 }
                 m_bvh[m] = new CsgBvh(boxes);
             }
+            if (s_debugPair != null)
+            {
+                var parts = s_debugPair.Split(',');
+                foreach (var ts in parts)
+                {
+                    var t = int.Parse(ts);
+                    Console.WriteLine($"PREWELD tri {t} mesh {m_kernel.TriMesh[t]} face {m_kernel.TriFace[t]}: " +
+                        $"{m_kernel.T0[t]}@{m_kernel.Positions[m_kernel.T0[t]]} {m_kernel.T1[t]}@{m_kernel.Positions[m_kernel.T1[t]]} " +
+                        $"{m_kernel.T2[t]}@{m_kernel.Positions[m_kernel.T2[t]]}");
+                }
+            }
             var pairs = new List<(int, int)>();
             for (var i = 0; i < n; i++)
                 for (var j = i + 1; j < n; j++)
                 {
                     if (!m_bvh[i].RootBox.Intersects(m_bvh[j].RootBox)) continue;
                     var ti = m_triOf[i]; var tj = m_triOf[j];
-                    m_bvh[i].ForEachIntersectingPair(m_bvh[j], (x, y) => pairs.Add((ti[x], tj[y])));
+                    m_bvh[i].ForEachIntersectingPair(m_bvh[j], (x, y) =>
+                    {
+                        if (s_debugPair != null && s_debugPair == $"{ti[x]},{tj[y]}")
+                            Console.WriteLine($"BROADPAIR {ti[x]},{tj[y]}");
+                        pairs.Add((ti[x], tj[y]));
+                    });
                 }
+            if (Environment.GetEnvironmentVariable("CSG_BRUTE") != null)
+            {
+                Box3d TriBox(int t) => new Box3d(
+                    m_kernel.Positions[m_kernel.T0[t]], m_kernel.Positions[m_kernel.T1[t]],
+                    m_kernel.Positions[m_kernel.T2[t]]).EnlargedBy(slackScene);
+                var set = new HashSet<(int, int)>(pairs);
+                var missing = 0;
+                for (var i = 0; i < n; i++)
+                    for (var j = i + 1; j < n; j++)
+                        foreach (var ta in m_triOf[i])
+                        {
+                            var ba = TriBox(ta);
+                            foreach (var tb in m_triOf[j])
+                                if (ba.Intersects(TriBox(tb)) && !set.Contains((ta, tb)) && missing++ < 8)
+                                    Console.WriteLine($"BRUTE missing pair {ta},{tb}");
+                        }
+                Console.WriteLine($"BRUTE {missing} missing of {pairs.Count} found");
+            }
             return pairs;
         }
 
@@ -576,6 +617,18 @@ namespace Aardvark.Geometry
         /// interval overlap. HeightSign is a pure function, so recomputing
         /// per pair is exactly as consistent as the former shared cache.
         /// </summary>
+        private static readonly string? s_debugPoint = Environment.GetEnvironmentVariable("CSG_DEBUG_POINT");
+
+        private bool NearDebugPoint(Span<int> vs)
+        {
+            if (s_debugPoint == null) return false;
+            var parts = s_debugPoint.Split(',');
+            var p = new V3d(double.Parse(parts[0]), double.Parse(parts[1]), double.Parse(parts[2]));
+            var box = Box3d.Invalid;
+            foreach (var v in vs) box.ExtendBy(m_kernel.Positions[v]);
+            return box.EnlargedBy(1e-4).Contains(p);
+        }
+
         private PairResult ComputePair(int ta, int tb)
         {
             var pa = m_kernel.TriPlane[ta];
@@ -583,10 +636,15 @@ namespace Aardvark.Geometry
 
             Span<int> va = stackalloc int[] { m_kernel.T0[ta], m_kernel.T1[ta], m_kernel.T2[ta] };
             Span<int> vb = stackalloc int[] { m_kernel.T0[tb], m_kernel.T1[tb], m_kernel.T2[tb] };
+            var dbgPt = NearDebugPoint(va) && NearDebugPoint(vb);
+            if (dbgPt) Console.WriteLine($"NEARPAIR {ta},{tb} groups {m_planeGroup[pa]},{m_planeGroup[pb]}");
 
             // welded planes: the pair is coplanar by canonicalization —
             // orientation from the geometric windings (a welded face's plane
             // may be snapped against its winding)
+            if (s_debugPair != null && s_debugPair == $"{ta},{tb}")
+                Console.WriteLine($"PAIR {ta},{tb}: groups {m_planeGroup[pa]},{m_planeGroup[pb]}" +
+                    (m_planeGroup[pa] == m_planeGroup[pb] ? $" overlap {CoplanarInteriorsOverlap(va, vb, pa)}" : ""));
             if (m_planeGroup[pa] == m_planeGroup[pb])
             {
                 if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
@@ -596,9 +654,9 @@ namespace Aardvark.Geometry
             Span<Sign3> sb = stackalloc Sign3[3];
             Span<Sign3> sa = stackalloc Sign3[3];
             for (var i = 0; i < 3; i++) sb[i] = Sign(pa, vb[i]);
-            if (AllStrict(sb, Sign3.Above) || AllStrict(sb, Sign3.Below)) return default;
+            if (AllStrict(sb, Sign3.Above) || AllStrict(sb, Sign3.Below)) { if (dbgPt) Console.WriteLine($"  reject sb {sb[0]},{sb[1]},{sb[2]}"); return default; }
             for (var i = 0; i < 3; i++) sa[i] = Sign(pb, va[i]);
-            if (AllStrict(sa, Sign3.Above) || AllStrict(sa, Sign3.Below)) return default;
+            if (AllStrict(sa, Sign3.Above) || AllStrict(sa, Sign3.Below)) { if (dbgPt) Console.WriteLine($"  reject sa {sa[0]},{sa[1]},{sa[2]}"); return default; }
 
             if (AllOn(sa) && AllOn(sb))
             {
@@ -608,7 +666,7 @@ namespace Aardvark.Geometry
 
             var crossA = CrossingPoints(va, sa, pb);
             var crossB = CrossingPoints(vb, sb, pa);
-            if (crossA.Count < 2 || crossB.Count < 2) return default;
+            if (crossA.Count < 2 || crossB.Count < 2) { if (dbgPt) Console.WriteLine($"  reject cross {crossA.Count},{crossB.Count} sa {sa[0]},{sa[1]},{sa[2]} sb {sb[0]},{sb[1]},{sb[2]}"); return default; }
 
 
             var dir = m_kernel.Planes[pa].Normal.Cross(m_kernel.Planes[pb].Normal);
@@ -616,8 +674,9 @@ namespace Aardvark.Geometry
             var (loB, hiB) = Interval(crossB, dir);
             var (lo, loCutPlane) = loA.T > loB.T ? (loA, pb) : (loB, pa);
             var (hi, hiCutPlane) = hiA.T < hiB.T ? (hiA, pb) : (hiB, pa);
-            if (lo.T >= hi.T) return default;
-            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, lo.P.Factor.Max(hi.P.Factor))) return default;
+            if (lo.T >= hi.T) { if (dbgPt) Console.WriteLine($"  reject interval {lo.T}..{hi.T}"); return default; }
+            if (m_eps.AreCoincident(lo.P.Pos, hi.P.Pos, lo.P.Factor.Max(hi.P.Factor))) { if (dbgPt) Console.WriteLine($"  reject touch {lo.P.Pos} {hi.P.Pos}"); return default; }
+            if (dbgPt) Console.WriteLine($"  segment {lo.P.Pos} -> {hi.P.Pos}");
             return new PairResult(lo.P, loCutPlane, hi.P, hiCutPlane);
         }
 
@@ -628,8 +687,8 @@ namespace Aardvark.Geometry
             {
                 case PairKind.None: return;
                 case PairKind.Coplanar:
-                    m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, r.CoplanarSame));
-                    m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, r.CoplanarSame));
+                    m_coplanar.GetOrCreate(ta, _ => new List<(int, bool, double)>()).Add((tb, r.CoplanarSame, r.CoplanarFactor));
+                    m_coplanar.GetOrCreate(tb, _ => new List<(int, bool, double)>()).Add((ta, r.CoplanarSame, r.CoplanarFactor));
                     // exactly-coplanar faces (slab within the baseline factor)
                     // keep the original path: side-face pairs provide the
                     // curves. Approximately welded faces need explicit outline
@@ -648,13 +707,20 @@ namespace Aardvark.Geometry
                 case PairKind.Segment:
                     var v0 = Materialize(r.Lo, r.LoCutPlane);
                     var v1 = Materialize(r.Hi, r.HiCutPlane);
+                    var dbgSeg = s_debugPoint != null && NearDebugPoint(stackalloc[] { v0, v1 });
+                    if (dbgSeg)
+                        Console.WriteLine($"MATSEG {ta},{tb}: v0 {v0}@{m_kernel.Positions[v0]} v1 {v1}@{m_kernel.Positions[v1]} " +
+                            $"wf {WithinFace(ta, v0)},{WithinFace(ta, v1)},{WithinFace(tb, v0)},{WithinFace(tb, v1)}");
                     if (v0 == v1) return;
-                    // a segment is only real if both endpoints lie inside-or-on
-                    // BOTH faces within their tolerance factors; grazing
-                    // vertex-adjacent pairs can produce sub-resolution
-                    // micro-segments scattered outside the faces — dropped
-                    if (!WithinFace(ta, v0) || !WithinFace(ta, v1)
-                        || !WithinFace(tb, v0) || !WithinFace(tb, v1)) return;
+                    // endpoints marginally outside a face (an exit point on
+                    // the partner's edge can scatter past it by more than its
+                    // creation factor) get honestly widened factors instead of
+                    // killing a real segment — that would puncture the cut
+                    // curve and break region classification. Only endpoints
+                    // beyond MaxFactor absorption drop the segment.
+                    bool InFace(int tri2, int vid2) => WithinFace(tri2, vid2) || EnsureInsertable(tri2, vid2);
+                    if (!InFace(ta, v0) || !InFace(ta, v1)
+                        || !InFace(tb, v0) || !InFace(tb, v1)) return;
                     AddConstraint(ta, v0, v1);
                     AddConstraint(tb, v0, v1);
                     return;
@@ -874,6 +940,8 @@ namespace Aardvark.Geometry
         }
 
         private static readonly bool s_debugReg = Environment.GetEnvironmentVariable("CSG_DEBUG_REG") != null;
+        private static readonly string? s_debugFrag = Environment.GetEnvironmentVariable("CSG_DEBUG_FRAG");
+        private static readonly string? s_debugPair = Environment.GetEnvironmentVariable("CSG_DEBUG_PAIR");
 
         #endregion
 
@@ -941,6 +1009,8 @@ namespace Aardvark.Geometry
                 }
             }
 
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_REGIONS") != null)
+                Console.WriteLine($"FACECON-PRE faces {m_faceConstraints.Count} segs {System.Linq.Enumerable.Sum(m_faceConstraints.Values, v => v.Count)}");
             DedupeEdgeAssignments();
             // the dedupe pass measured edge scatter and widened factors —
             // re-weld so points that became coincident under honest factors
@@ -1034,7 +1104,7 @@ namespace Aardvark.Geometry
                     {
                         if (cdt.KnowsKernel(vid)) continue;
                         var t = t0.Clamp(1e-9, 1 - 1e-9);
-                        try { cdt.InsertOnEdge(prev, sv, vid, u2 + t * (v2 - u2)); }
+                        try { cdt.InsertOnEdge(prev, sv, vid, u2 + t * (v2 - u2), 1 << i); }
                         catch (CsgVerificationException e) { throw new CsgVerificationException(Diag(e, vid)); }
                         prev = vid;
                     }
@@ -1052,6 +1122,9 @@ namespace Aardvark.Geometry
                 try
                 {
                     results[tri] = cdt.Triangulate();
+                    if (s_debugFace == tri.ToString())
+                        foreach (var (a, b, c) in results[tri]!.Value.Tris)
+                            Console.WriteLine($"  outtri {a},{b},{c}");
                 }
                 catch (CsgVerificationException e)
                 {
@@ -1084,6 +1157,43 @@ namespace Aardvark.Geometry
                 if (results[tri] == null) continue;
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
                 foreach (var (a, b) in results[tri]!.Value.Constraints) barrier.Add(EdgeKey(a, b));
+            }
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_REGIONS") != null)
+            {
+                for (var m2 = 0; m2 < m_barriers.Length; m2++)
+                    Console.WriteLine($"BARRIERS mesh {m2}: {m_barriers[m2].Count}");
+                Console.WriteLine($"FACECON faces {m_faceConstraints.Count} segs {System.Linq.Enumerable.Sum(m_faceConstraints.Values, v => v.Count)}");
+                var fragEdges = new HashSet<long>[m_barriers.Length];
+                for (var m2 = 0; m2 < m_barriers.Length; m2++) fragEdges[m2] = new HashSet<long>();
+                foreach (var fr in Fragments)
+                {
+                    var fm = m_kernel.TriMesh[fr.Parent];
+                    fragEdges[fm].Add(EdgeKey(fr.V0, fr.V1));
+                    fragEdges[fm].Add(EdgeKey(fr.V1, fr.V2));
+                    fragEdges[fm].Add(EdgeKey(fr.V2, fr.V0));
+                }
+                for (var m2 = 0; m2 < m_barriers.Length; m2++)
+                {
+                    var deg = new Dictionary<int, int>();
+                    foreach (var k in m_barriers[m2])
+                    {
+                        var u = (int)(k >> 32); var w = (int)k;
+                        deg[u] = (deg.TryGetValue(u, out var du) ? du : 0) + 1;
+                        deg[w] = (deg.TryGetValue(w, out var dw) ? dw : 0) + 1;
+                    }
+                    var odd = new List<int>();
+                    foreach (var (v2, d2) in deg) if ((d2 & 1) != 0) odd.Add(v2);
+                    Console.WriteLine($"BARRIERDEG mesh {m2}: {odd.Count} odd-degree of {deg.Count}");
+                    for (var oi = 0; oi < odd.Count && oi < 6; oi++)
+                    {
+                        var ov = odd[oi];
+                        Console.WriteLine($"  odd {ov}@{m_kernel.Positions[ov]} f{m_kernel.TolFactor[ov]:0.#} rep {RepLate(ov)}");
+                        foreach (var (tri2, segs2) in m_faceConstraints)
+                            foreach (var (ca2, cb2) in segs2)
+                                if (ca2 == ov || cb2 == ov)
+                                    Console.WriteLine($"    con tri {tri2} mesh {m_kernel.TriMesh[tri2]}: ({ca2},{cb2})");
+                    }
+                }
             }
         }
 
@@ -1653,13 +1763,30 @@ namespace Aardvark.Geometry
                 var partners = m_coplanar.GetOrDefault(frag.Parent);
                 if (partners == null) continue;
                 var centroid = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
-                foreach (var (partner, same) in partners)
+                var ff = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
+                    ? Eps.GenerationFactor
+                    : Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
+                        .Max(Eps.GenerationFactor);
+                foreach (var (partner, same, slab) in partners)
                 {
                     var pm = m_kernel.TriMesh[partner];
                     if (m_rel[f * n + pm] != 0) continue;
-                    if (!CoplanarCovers(partner, centroid)) continue;
+                    // coverage at the pair's working factor: grazing sheets
+                    // scatter sliver centroids beyond the baseline band
+                    var pf = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
+                        ? Eps.GenerationFactor
+                        : Fun.Max(slab, ff)
+                            .Max(m_kernel.TolFactor[m_kernel.T0[partner]])
+                            .Max(m_kernel.TolFactor[m_kernel.T1[partner]])
+                            .Max(m_kernel.TolFactor[m_kernel.T2[partner]]);
+                    var covers = CoplanarCovers(partner, centroid, pf);
+                    if (s_debugFrag == f.ToString())
+                        Console.WriteLine($"FRAG {f}: partner {partner} mesh {pm} same {same} pf {pf:0.#} covers {covers}");
+                    if (!covers) continue;
                     m_rel[f * n + pm] = (byte)(same ? FragLabel.OnSame : FragLabel.OnOpposite);
                 }
+                if (s_debugFrag == f.ToString() && partners.Count == 0)
+                    Console.WriteLine($"FRAG {f}: no partners");
             }
 
             // fragment adjacency across shared (canonical) sub-edges via one sort
@@ -1754,6 +1881,8 @@ namespace Aardvark.Geometry
             Lap2("classify-flood");
             // per (region × other mesh) classification is independent: reads
             // the kernel and BVHs, writes disjoint label slots
+            if (Environment.GetEnvironmentVariable("CSG_DEBUG_REGIONS") != null)
+                Console.WriteLine($"REGIONS: {regions.Count} sizes {string.Join(",", System.Linq.Enumerable.Select(System.Linq.Enumerable.Take(regions, 20), r => r.Count))}");
             CsgParallel.For(0, regions.Count, m_maxThreads, ri =>
             {
                 var region = regions[ri];
@@ -1770,6 +1899,8 @@ namespace Aardvark.Geometry
                     }
                     if (pre == 0)
                         pre = (byte)(RegionIsInsideOther(region, m) ? FragLabel.Inside : FragLabel.Outside);
+                    if (Environment.GetEnvironmentVariable("CSG_DEBUG_REGIONS") != null)
+                        Console.WriteLine($"REGION {ri} mesh {mi} size {region.Count} vs {m}: {(FragLabel)pre}");
                     foreach (var f in region)
                         if (m_rel[f * n + m] == 0) m_rel[f * n + m] = pre;
                 }
@@ -1785,7 +1916,7 @@ namespace Aardvark.Geometry
         /// so an On answer here can only mean "on an interior edge of the
         /// covered region".
         /// </summary>
-        private bool CoplanarCovers(int partner, in V3d p)
+        private bool CoplanarCovers(int partner, in V3d p, double factor = Eps.GenerationFactor)
         {
             var n = m_kernel.Planes[m_kernel.TriPlane[partner]].Normal;
             Span<V2d> t = stackalloc V2d[3];
@@ -1794,9 +1925,9 @@ namespace Aardvark.Geometry
             t[2] = Triangulator.ProjectDominant(n, m_kernel.Positions[m_kernel.T2[partner]]);
             if (!MakeCcw(t)) return false;
             var q = Triangulator.ProjectDominant(n, p);
-            return m_eps.AreaSign(t[0], t[1], q, Eps.GenerationFactor) != Sign3.Below
-                && m_eps.AreaSign(t[1], t[2], q, Eps.GenerationFactor) != Sign3.Below
-                && m_eps.AreaSign(t[2], t[0], q, Eps.GenerationFactor) != Sign3.Below;
+            return m_eps.AreaSign(t[0], t[1], q, factor) != Sign3.Below
+                && m_eps.AreaSign(t[1], t[2], q, factor) != Sign3.Below
+                && m_eps.AreaSign(t[2], t[0], q, factor) != Sign3.Below;
         }
 
         private bool RegionIsInsideOther(List<int> region, int otherMesh)
@@ -1807,9 +1938,13 @@ namespace Aardvark.Geometry
             {
                 var frag = Fragments[f];
                 var o = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
+                var of = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
+                    ? Eps.GenerationFactor
+                    : Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
+                        .Max(Eps.GenerationFactor);
                 foreach (var dir in s_rayDirs)
                 {
-                    var parity = RayParity(o, dir, otherMesh);
+                    var parity = RayParity(o, dir, otherMesh, of);
                     if (parity.HasValue) return parity.Value;
                 }
             }
@@ -1817,23 +1952,29 @@ namespace Aardvark.Geometry
         }
 
         /// <summary>Parity of ray/other-mesh crossings; null when any hit is eps-ambiguous. BVH-accelerated.</summary>
-        private bool? RayParity(V3d o, V3d dir, int otherMesh)
+        private bool? RayParity(V3d o, V3d dir, int otherMesh, double originFactor = Eps.GenerationFactor)
         {
             var count = 0;
             foreach (var t in m_bvh[otherMesh].RayCandidates(o, dir, m_triOf[otherMesh]))
             {
                 var plane = m_kernel.Planes[m_kernel.TriPlane[t]];
+                // a hit near the origin on grazing geometry poisons parity at
+                // the WIDENED tolerances, not just the baseline band
+                var tf = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
+                    ? Eps.GenerationFactor
+                    : originFactor.Max(m_kernel.TolFactor[m_kernel.T0[t]])
+                        .Max(m_kernel.TolFactor[m_kernel.T1[t]]).Max(m_kernel.TolFactor[m_kernel.T2[t]]);
                 var denom = plane.Normal.Dot(dir);
                 var h = plane.Normal.Dot(o) - plane.Distance;
                 if (denom.Abs() < 1e-9)
                 {
-                    if (m_eps.HeightSign(plane, o, Eps.GenerationFactor) == Sign3.On) return null; // ray (nearly) in plane near origin
+                    if (m_eps.HeightSign(plane, o, tf) == Sign3.On) return null; // ray (nearly) in plane near origin
                     continue;
                 }
                 var s = -h / denom;
                 if (s <= 0) continue;
                 var hit = o + s * dir;
-                if (m_eps.AreCoincident(hit, o, Eps.GenerationFactor)) return null; // origin on the other surface
+                if (m_eps.AreCoincident(hit, o, tf)) return null; // origin on the other surface
 
                 var p0 = Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[m_kernel.T0[t]]);
                 var p1 = Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[m_kernel.T1[t]]);
