@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using Aardvark.Base;
 
 namespace Aardvark.Geometry
@@ -51,5 +52,19 @@ namespace Aardvark.Geometry
 
         public static PolyMesh[] Xor(PolyMesh a, PolyMesh b, CsgOptions? options = null)
             => CsgArrangement.Arrange(a, b, options).Xor();
+
+        /// <summary>N-ary union in a single arrangement (one kernel, one subdivision — cheaper than a pairwise cascade).</summary>
+        public static PolyMesh[] Union(PolyMesh[] solids, CsgOptions? options = null)
+            => solids.Length == 1 ? new[] { solids[0] } : CsgArrangement.Arrange(solids, options).Union();
+
+        /// <summary>N-ary intersection in a single arrangement.</summary>
+        public static PolyMesh[] Intersection(PolyMesh[] solids, CsgOptions? options = null)
+            => solids.Length == 1 ? new[] { solids[0] } : CsgArrangement.Arrange(solids, options).Intersection();
+
+        /// <summary>a minus the union of all subtrahends, in a single arrangement.</summary>
+        public static PolyMesh[] Difference(PolyMesh a, PolyMesh[] subtrahends, CsgOptions? options = null)
+            => subtrahends.Length == 0
+                ? new[] { a }
+                : CsgArrangement.Arrange(new[] { a }.Concat(subtrahends).ToArray(), options).Difference();
     }
 }

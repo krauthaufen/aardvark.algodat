@@ -36,7 +36,13 @@ namespace Aardvark.Geometry
         /// <summary>kernel vertex id → canonical vertex id (weld representative)</summary>
         public int[] Canon = Array.Empty<int>();
         public readonly List<Fragment> Fragments = new();
-        public readonly List<FragLabel> Labels = new();
+        /// <summary>per (fragment, other mesh) classification, [frag * MeshCount + mesh]; self slot unused</summary>
+        private byte[] m_rel = Array.Empty<byte>();
+
+        public FragLabel Label(int frag, int otherMesh)
+            => (FragLabel)m_rel[frag * m_kernel.MeshCount + otherMesh];
+
+        public bool HasCoincidentContact => m_coplanar.Count > 0;
 
         private readonly Dictionary<long, Sign3> m_signCache = new(MixedLongComparer.Instance);
         private readonly Dictionary<(int, int, int), int> m_cutCache = new(); // (edgeMin, edgeMax, planeId) -> vid
@@ -62,20 +68,18 @@ namespace Aardvark.Geometry
         }
         private readonly Dictionary<(int, int), HashSet<int>> m_edgePoints = new(); // canonical edge -> points on it
         private readonly Dictionary<int, HashSet<(int, int)>> m_faceConstraints = new(); // kernel tri -> segments
-        private readonly HashSet<long>[] m_barriers = { new(MixedLongComparer.Instance), new(MixedLongComparer.Instance) }; // per mesh: constraint sub-edges (packed keys)
+        private HashSet<long>[] m_barriers = Array.Empty<HashSet<long>>(); // per mesh: constraint sub-edges (packed keys)
         private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
-        private readonly CsgBvh?[] m_bvh = new CsgBvh?[2];
-        private readonly int[][] m_triOf = new int[2][];
-        private Box3d[][] m_pairPhaseBoxes = new Box3d[2][];
-
-        private CsgBvh RayBvh(int mesh)
-            => m_bvh[mesh] ??= new CsgBvh(m_pairPhaseBoxes[mesh]);
+        private CsgBvh[] m_bvh = Array.Empty<CsgBvh>();
+        private int[][] m_triOf = Array.Empty<int[]>();
 
         public Pipeline(Kernel kernel)
         {
             kernel.UpdateSceneScale();
             m_kernel = kernel;
             m_eps = kernel.Eps;
+            m_barriers = new HashSet<long>[kernel.MeshCount]
+                .SetByIndex(_ => new HashSet<long>(MixedLongComparer.Instance));
         }
 
         public void Run()
@@ -179,10 +183,11 @@ namespace Aardvark.Geometry
             m_vertexGridHeads[key] = vid;
         }
 
-        /// <summary>Existing kernel vertex coincident with p (generation-1 tolerance), or -1.</summary>
-        private int GridFindCoincident(in V3d p)
+        /// <summary>Existing kernel vertex coincident with p (given generation's tolerance), or -1.</summary>
+        private int GridFindCoincident(in V3d p, int generation = 1)
         {
-            var tol = 8 * m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
+            var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene);
+            for (var g = 0; g < generation; g++) tol *= Eps.GenerationFactor;
             var cx0 = (long)Fun.Floor((p.X - tol) / m_gridH); var cx1 = (long)Fun.Floor((p.X + tol) / m_gridH);
             var cy0 = (long)Fun.Floor((p.Y - tol) / m_gridH); var cy1 = (long)Fun.Floor((p.Y + tol) / m_gridH);
             var cz0 = (long)Fun.Floor((p.Z - tol) / m_gridH); var cz1 = (long)Fun.Floor((p.Z + tol) / m_gridH);
@@ -192,7 +197,7 @@ namespace Aardvark.Geometry
                     {
                         if (!m_vertexGridHeads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
                         for (; j >= 0; j = m_vertexGridNext[j])
-                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], 1)) return j;
+                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], generation)) return j;
                     }
             return -1;
         }
@@ -216,42 +221,35 @@ namespace Aardvark.Geometry
 
         private List<(int, int)> BroadPhase()
         {
-            // pair-phase BVHs contain only triangles whose box reaches the
-            // other mesh's bounds — nothing else can produce a candidate pair,
-            // and the (expensive) SAH build shrinks to the overlap region.
-            // Ray-parity BVHs must cover whole meshes and are built separately.
+            var n = m_kernel.MeshCount;
+            m_bvh = new CsgBvh[n];
+            m_triOf = new int[n][];
             var slackScene = 8 * m_eps.Relative * (m_eps.Scene + 1e-300);
-            var pairBox = new Box3d[2];
-            for (var m = 0; m < 2; m++) pairBox[m] = m_kernel.Bounds[1 - m].EnlargedBy(2 * slackScene);
-
-            var boxes = new Box3d[2][];
-            var pairTriOf = new int[2][];
-            var pairBoxes = new List<Box3d>[2];
-            for (var m = 0; m < 2; m++)
+            for (var m = 0; m < n; m++)
             {
                 var list = new List<int>();
-                var pairList = new List<int>();
-                pairBoxes[m] = new List<Box3d>();
                 for (var t = 0; t < m_kernel.TriangleCount; t++)
                     if (m_kernel.TriMesh[t] == m) list.Add(t);
                 m_triOf[m] = list.ToArray();
-                boxes[m] = new Box3d[list.Count];
+                var boxes = new Box3d[list.Count];
                 for (var i = 0; i < list.Count; i++)
                 {
                     var t = list[i];
                     var p0 = m_kernel.Positions[m_kernel.T0[t]];
                     var p1 = m_kernel.Positions[m_kernel.T1[t]];
                     var p2 = m_kernel.Positions[m_kernel.T2[t]];
-                    var box = new Box3d(p0, p1, p2).EnlargedBy(slackScene);
-                    boxes[m][i] = box;
-                    if (box.Intersects(pairBox[m])) { pairList.Add(t); pairBoxes[m].Add(box); }
+                    boxes[i] = new Box3d(p0, p1, p2).EnlargedBy(slackScene);
                 }
-                pairTriOf[m] = pairList.ToArray();
+                m_bvh[m] = new CsgBvh(boxes);
             }
             var pairs = new List<(int, int)>();
-            new CsgBvh(pairBoxes[0].ToArray()).ForEachIntersectingPair(new CsgBvh(pairBoxes[1].ToArray()),
-                (i, j) => pairs.Add((pairTriOf[0][i], pairTriOf[1][j])));
-            m_pairPhaseBoxes = boxes;
+            for (var i = 0; i < n; i++)
+                for (var j = i + 1; j < n; j++)
+                {
+                    if (!m_bvh[i].RootBox.Intersects(m_bvh[j].RootBox)) continue;
+                    var ti = m_triOf[i]; var tj = m_triOf[j];
+                    m_bvh[i].ForEachIntersectingPair(m_bvh[j], (x, y) => pairs.Add((ti[x], tj[y])));
+                }
             return pairs;
         }
 
@@ -445,6 +443,8 @@ namespace Aardvark.Geometry
 
         private void Subdivide()
         {
+            SplitConstraints();
+
             // T-junction pass: constraint endpoints that lie on a face's
             // boundary edge are registered on that (shared) edge so the
             // neighbor subdivides identically
@@ -549,6 +549,123 @@ namespace Aardvark.Geometry
 
         private int m_diagTri;
 
+        /// <summary>
+        /// Resolves interactions between constraint segments before
+        /// triangulation. Two effects, both recorded in a GLOBAL per-segment
+        /// split map and applied to every face carrying the segment (a face
+        /// pair shares each segment, and with three or more solids a vertex on
+        /// a segment can be known to only one of its faces):
+        /// (1) proper crossings of two segments in a face (three-plane points,
+        ///     generation-2, welded through the vertex grid);
+        /// (2) vertices of a face's point pool (constraint endpoints and
+        ///     boundary points) lying on a segment's interior.
+        /// </summary>
+        private void SplitConstraints()
+        {
+            var splits = new Dictionary<(int, int), HashSet<int>>();
+            void AddSplit((int, int) seg, int vid)
+                => splits.GetOrCreate(seg, _ => new HashSet<int>()).Add(vid);
+
+            foreach (var (tri, constraints) in m_faceConstraints)
+            {
+                var normal = m_kernel.Planes[m_kernel.TriPlane[tri]].Normal;
+                var segs = new List<(int, int)>(constraints).ToArray();
+
+                // (1) proper crossings within this face
+                if (m_kernel.MeshCount > 2)
+                {
+                    for (var i = 0; i < segs.Length; i++)
+                    {
+                        var (a, b) = segs[i];
+                        var a2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[a]);
+                        var b2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[b]);
+                        for (var j = i + 1; j < segs.Length; j++)
+                        {
+                            var (c, d) = segs[j];
+                            if (a == c || a == d || b == c || b == d) continue;
+                            var c2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[c]);
+                            var d2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[d]);
+                            var sc = m_eps.AreaSign(a2, b2, c2, 1);
+                            var sd = m_eps.AreaSign(a2, b2, d2, 1);
+                            if (!((sc == Sign3.Above && sd == Sign3.Below) || (sc == Sign3.Below && sd == Sign3.Above))) continue;
+                            var sa = m_eps.AreaSign(c2, d2, a2, 1);
+                            var sb = m_eps.AreaSign(c2, d2, b2, 1);
+                            if (!((sa == Sign3.Above && sb == Sign3.Below) || (sa == Sign3.Below && sb == Sign3.Above))) continue;
+
+                            var num = Det(c2 - a2, d2 - c2);
+                            var den = Det(b2 - a2, d2 - c2);
+                            if (den == 0.0) continue;
+                            var t = num / den;
+                            var p = m_kernel.Positions[a] + t.Clamp(0, 1) * (m_kernel.Positions[b] - m_kernel.Positions[a]);
+                            var gen = (byte)(1 + Fun.Max(
+                                m_kernel.Generation[a], m_kernel.Generation[b],
+                                m_kernel.Generation[c], m_kernel.Generation[d]).Max((byte)1));
+                            var vid = GridFindCoincident(p, gen);
+                            if (vid < 0)
+                            {
+                                vid = m_kernel.Positions.Count;
+                                m_kernel.Positions.Add(p);
+                                m_kernel.Generation.Add(gen);
+                                GridAdd(vid);
+                            }
+                            AddSplit(segs[i], vid);
+                            AddSplit(segs[j], vid);
+                        }
+                    }
+                }
+
+                // (2) pool vertices on segment interiors
+                var pool = new HashSet<int>();
+                foreach (var (a, b) in segs) { pool.Add(a); pool.Add(b); }
+                var boundary = BoundaryPoints(tri);
+                if (boundary != null) foreach (var v in boundary) pool.Add(v);
+
+                foreach (var seg in segs)
+                {
+                    var (a, b) = seg;
+                    var a2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[a]);
+                    var b2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[b]);
+                    var d2 = b2 - a2;
+                    var len2 = d2.LengthSquared;
+                    foreach (var v in pool)
+                    {
+                        if (v == a || v == b) continue;
+                        var v2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[v]);
+                        if (m_eps.AreaSign(a2, b2, v2, 1) != Sign3.On) continue;
+                        var t = d2.Dot(v2 - a2);
+                        if (t <= 0 || t >= len2) continue;
+                        AddSplit(seg, v);
+                    }
+                }
+            }
+            if (splits.Count == 0) return;
+
+            // apply the global split map in every face carrying a split segment
+            foreach (var (_, constraints) in m_faceConstraints)
+            {
+                var segs = new List<(int, int)>(constraints).ToArray();
+                foreach (var seg in segs)
+                {
+                    if (!splits.TryGetValue(seg, out var points)) continue;
+                    constraints.Remove(seg);
+                    var (a, b) = seg;
+                    var dir = m_kernel.Positions[b] - m_kernel.Positions[a];
+                    var sorted = new List<int>(points);
+                    sorted.Sort((x, y) => dir.Dot(m_kernel.Positions[x] - m_kernel.Positions[a])
+                        .CompareTo(dir.Dot(m_kernel.Positions[y] - m_kernel.Positions[a])));
+                    var prev = a;
+                    foreach (var v in sorted)
+                    {
+                        if (v != prev) constraints.Add(SortedEdge(prev, v));
+                        prev = v;
+                    }
+                    if (prev != b) constraints.Add(SortedEdge(prev, b));
+                }
+            }
+
+            static double Det(V2d u, V2d v) => u.X * v.Y - u.Y * v.X;
+        }
+
         private List<int>? BoundaryPoints(int tri)
         {
             List<int>? result = null;
@@ -579,9 +696,28 @@ namespace Aardvark.Geometry
 
         private void Classify()
         {
-            // fragment adjacency across shared (canonical) sub-edges via one
-            // sort per mesh (edge key packs the mesh in the low bit region is
-            // unnecessary: keys already collide only within a mesh's flood)
+            var n = m_kernel.MeshCount;
+            m_rel = new byte[Fragments.Count * n]; // FragLabel.Outside
+
+            // coplanar-covered fragments are labeled directly per partner mesh
+            // (their coverage boundary is made of constraint edges, so regions
+            // are uniform with respect to every other mesh)
+            for (var f = 0; f < Fragments.Count; f++)
+            {
+                var frag = Fragments[f];
+                var partners = m_coplanar.GetOrDefault(frag.Parent);
+                if (partners == null) continue;
+                var centroid = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
+                foreach (var (partner, same) in partners)
+                {
+                    var pm = m_kernel.TriMesh[partner];
+                    if (m_rel[f * n + pm] != 0) continue;
+                    if (!CoplanarCovers(partner, centroid)) continue;
+                    m_rel[f * n + pm] = (byte)(same ? FragLabel.OnSame : FragLabel.OnOpposite);
+                }
+            }
+
+            // fragment adjacency across shared (canonical) sub-edges via one sort
             var keys = new long[Fragments.Count * 3];
             var frags = new int[Fragments.Count * 3];
             for (var f = 0; f < Fragments.Count; f++)
@@ -593,7 +729,6 @@ namespace Aardvark.Geometry
                 frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
             }
             Array.Sort(keys, frags);
-            // neighbors per fragment (grouped runs of equal keys, same mesh, non-barrier)
             var adjacency = new List<int>[Fragments.Count].SetByIndex(_ => new List<int>(3));
             for (var i = 0; i < keys.Length;)
             {
@@ -612,49 +747,44 @@ namespace Aardvark.Geometry
                 i = j;
             }
 
-            Labels.Clear();
-            for (var f = 0; f < Fragments.Count; f++) Labels.Add(FragLabel.Outside);
-            var labeled = new bool[Fragments.Count];
-
-            // coplanar-covered fragments are labeled directly (their coverage
-            // boundary is made of constraint edges, so they are flood-isolated)
-            for (var f = 0; f < Fragments.Count; f++)
-            {
-                var frag = Fragments[f];
-                var partners = m_coplanar.GetOrDefault(frag.Parent);
-                if (partners == null) continue;
-                var centroid = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
-                foreach (var (partner, same) in partners)
-                {
-                    if (!CoplanarCovers(partner, centroid)) continue;
-                    Labels[f] = same ? FragLabel.OnSame : FragLabel.OnOpposite;
-                    labeled[f] = true;
-                    break;
-                }
-            }
-
+            var visited = new bool[Fragments.Count];
             for (var seedFrag = 0; seedFrag < Fragments.Count; seedFrag++)
             {
-                if (labeled[seedFrag]) continue;
-                var mesh = m_kernel.TriMesh[Fragments[seedFrag].Parent];
+                if (visited[seedFrag]) continue;
+                var mi = m_kernel.TriMesh[Fragments[seedFrag].Parent];
                 var region = new List<int>();
                 var stack = new Stack<int>();
                 stack.Push(seedFrag);
-                labeled[seedFrag] = true;
+                visited[seedFrag] = true;
                 while (stack.Count > 0)
                 {
                     var f = stack.Pop();
                     region.Add(f);
                     foreach (var g in adjacency[f])
                     {
-                        if (labeled[g]) continue;
-                        labeled[g] = true;
+                        if (visited[g]) continue;
+                        visited[g] = true;
                         stack.Push(g);
                     }
                 }
 
-                var inside = RegionIsInsideOther(region, 1 - mesh);
-                foreach (var f in region) Labels[f] = inside ? FragLabel.Inside : FragLabel.Outside;
+                // per other mesh: coverage is uniform across the region — use a
+                // pre-set coplanar label if any fragment has one, else ray parity
+                for (var m = 0; m < n; m++)
+                {
+                    if (m == mi) continue;
+                    byte pre = 0;
+                    foreach (var f in region)
+                    {
+                        if (m_rel[f * n + m] == 0) continue;
+                        pre = m_rel[f * n + m];
+                        break;
+                    }
+                    if (pre == 0)
+                        pre = (byte)(RegionIsInsideOther(region, m) ? FragLabel.Inside : FragLabel.Outside);
+                    foreach (var f in region)
+                        if (m_rel[f * n + m] == 0) m_rel[f * n + m] = pre;
+                }
             }
         }
 
@@ -702,7 +832,7 @@ namespace Aardvark.Geometry
         private bool? RayParity(V3d o, V3d dir, int otherMesh)
         {
             var count = 0;
-            foreach (var t in RayBvh(otherMesh).RayCandidates(o, dir, m_triOf[otherMesh]))
+            foreach (var t in m_bvh[otherMesh].RayCandidates(o, dir, m_triOf[otherMesh]))
             {
                 var plane = m_kernel.Planes[m_kernel.TriPlane[t]];
                 var denom = plane.Normal.Dot(dir);

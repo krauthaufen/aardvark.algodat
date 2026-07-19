@@ -30,10 +30,13 @@ namespace Aardvark.Geometry
         public readonly List<Plane3d> Planes = new();
 
         // per input mesh
-        public readonly int[] VertexOffset = new int[2];
-        public readonly int[] VertexCount = new int[2];
-        public readonly Range1i[] TriRange = new Range1i[2];
-        public readonly Box3d[] Bounds = new Box3d[2];
+        public readonly List<int> VertexOffset = new();
+        public readonly List<int> VertexCount = new();
+        public readonly List<Box3d> Bounds = new();
+        /// <summary>source mesh per vertex; -1 for derived (cut) vertices</summary>
+        public readonly List<int> VertexMesh = new();
+
+        public int MeshCount => VertexOffset.Count;
 
         public Kernel(Eps eps) => Eps = eps;
 
@@ -47,13 +50,8 @@ namespace Aardvark.Geometry
 
         public int TriangleCount => T0.Count;
 
-        /// <summary>Source mesh (0/1) of a kernel vertex, or -1 for derived vertices.</summary>
-        public int VertexSourceMesh(int vi)
-        {
-            if (vi >= VertexOffset[1] && vi < VertexOffset[1] + VertexCount[1]) return 1;
-            if (vi >= VertexOffset[0] && vi < VertexOffset[0] + VertexCount[0]) return 0;
-            return -1;
-        }
+        /// <summary>Source mesh of a kernel vertex, or -1 for derived vertices.</summary>
+        public int VertexSourceMesh(int vi) => vi < VertexMesh.Count ? VertexMesh[vi] : -1;
 
         /// <summary>
         /// Ingests one input mesh: verifies the watertight-manifold contract,
@@ -70,26 +68,30 @@ namespace Aardvark.Geometry
 
             var violation = ManifoldChecks.FindManifoldViolation(fia, via, pos.Length);
             if (violation != null)
-                throw new CsgInputException($"input mesh {(meshIndex == 0 ? "A" : "B")} is not a closed manifold: {violation}");
+                throw new CsgInputException($"input mesh {meshIndex} is not a closed manifold: {violation}");
 
+            if (meshIndex != MeshCount)
+                throw new ArgumentException($"meshes must be ingested in order (got index {meshIndex}, expected {MeshCount})");
+            if (meshIndex > 255)
+                throw new NotSupportedException("at most 256 solids per arrangement");
             var vertexOffset = Positions.Count;
-            VertexOffset[meshIndex] = vertexOffset;
-            VertexCount[meshIndex] = pos.Length;
+            VertexOffset.Add(vertexOffset);
+            VertexCount.Add(pos.Length);
             var bounds = Box3d.Invalid;
             var maxMag = Eps.Scene;
             for (var i = 0; i < pos.Length; i++)
             {
                 Positions.Add(pos[i]);
                 Generation.Add(0);
+                VertexMesh.Add(meshIndex);
                 bounds.ExtendBy(pos[i]);
                 maxMag = maxMag.Max(pos[i].NormMax);
             }
-            Bounds[meshIndex] = bounds;
+            Bounds.Add(bounds);
             // the scene scale must be known before any plane test (planarity
             // below), or tolerances collapse for faces passing near the origin
             Eps = Eps.WithScene(maxMag);
 
-            var triStart = TriangleCount;
             var polygon = new List<V3d>();
             var polygon2d = new List<V2d>();
             var earTris = new List<(int I0, int I1, int I2)>();
@@ -104,12 +106,12 @@ namespace Aardvark.Geometry
 
                 var plane = Triangulator.NewellPlane(CollectionsMarshalAsSpan(polygon));
                 if (plane.Normal == V3d.Zero)
-                    throw new CsgInputException($"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} is degenerate (zero Newell normal)");
+                    throw new CsgInputException($"mesh {meshIndex} face {fi} is degenerate (zero Newell normal)");
                 for (var i = 0; i < fvc; i++)
                 {
                     if (Eps.HeightSign(plane, polygon[i]) != Sign3.On)
                         throw new CsgInputException(
-                            $"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} is not planar within tolerance " +
+                            $"mesh {meshIndex} face {fi} is not planar within tolerance " +
                             $"(vertex {via[start + i]} off its face plane)");
                 }
                 var planeIndex = Planes.Count;
@@ -129,7 +131,7 @@ namespace Aardvark.Geometry
                     earTris.Clear();
                     if (!Triangulator.EarClip(CollectionsMarshalAsSpan(polygon2d), Eps, earTris))
                         throw new CsgInputException(
-                            $"mesh {(meshIndex == 0 ? "A" : "B")} face {fi} could not be triangulated (self-intersecting?)");
+                            $"mesh {meshIndex} face {fi} could not be triangulated (self-intersecting?)");
                     foreach (var (i0, i1, i2) in earTris)
                     {
                         AddTriangle(
@@ -138,7 +140,6 @@ namespace Aardvark.Geometry
                     }
                 }
             }
-            TriRange[meshIndex] = new Range1i(triStart, TriangleCount - 1);
         }
 
         private void AddTriangle(int v0, int v1, int v2, int plane, int meshIndex, int face, int c0, int c1, int c2)

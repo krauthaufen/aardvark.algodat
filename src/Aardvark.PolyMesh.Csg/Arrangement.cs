@@ -20,9 +20,9 @@ namespace Aardvark.Geometry
     }
 
     /// <summary>
-    /// The arranged form of two input solids: both meshes ingested into the
+    /// The arranged form of N input solids: all meshes ingested into the
     /// kernel, all mutual intersections resolved into fragments, and every
-    /// fragment labeled inside/outside the other solid. The boolean operations
+    /// fragment classified against every other solid. The boolean operations
     /// are cheap selections over this shared arrangement.
     /// </summary>
     public sealed class CsgArrangement
@@ -40,89 +40,133 @@ namespace Aardvark.Geometry
             m_options = options;
         }
 
-        /// <summary>True if the two solids have coincident (coplanar) surface regions.</summary>
-        public bool HasCoincidentContact => m_pipeline.Labels.Any(
-            l => l == FragLabel.OnSame || l == FragLabel.OnOpposite);
+        /// <summary>True if any two solids have coincident (coplanar) surface regions.</summary>
+        public bool HasCoincidentContact => m_pipeline.HasCoincidentContact;
+
+        public int SolidCount => m_sources.Length;
 
         public static CsgArrangement Arrange(PolyMesh a, PolyMesh b, CsgOptions? options = null)
+            => Arrange(new[] { a, b }, options);
+
+        /// <summary>Arranges N solids at once — one kernel, one set of BVHs, one subdivision.</summary>
+        public static CsgArrangement Arrange(PolyMesh[] solids, CsgOptions? options = null)
         {
+            if (solids.Length < 2) throw new ArgumentException("need at least two solids");
             var o = options ?? CsgOptions.Default;
             if (o.Verification == CsgVerification.None)
                 throw new NotSupportedException("verification cannot be disabled in v0");
             var kernel = new Kernel(new Eps(o.RelativeEpsilon));
-            kernel.Ingest(a, 0);
-            kernel.Ingest(b, 1);
+            for (var i = 0; i < solids.Length; i++) kernel.Ingest(solids[i], i);
             var pipeline = new Pipeline(kernel);
             pipeline.Run();
-            return new CsgArrangement(kernel, pipeline, new[] { a, b }, o);
+            return new CsgArrangement(kernel, pipeline, solids, o);
         }
 
-        // Coincident (coplanar) surface regions exist once in each input; the
-        // selection keeps A's copy when the region belongs to the result
-        // (OnSame for union/intersection) and drops B's, so the region is
-        // emitted exactly once.
+        // Coincident (coplanar) surface regions exist once in each covering
+        // solid; selections keep the copy of the lowest-indexed solid so the
+        // region is emitted exactly once.
 
-        /// <summary>Fragments of each solid outside the other; coincident same-facing regions kept once.</summary>
-        public PolyMesh[] Union() => Emit((mesh, label) => label switch
+        /// <summary>Boundary of the union of all solids.</summary>
+        public PolyMesh[] Union() => Emit((mi, f) =>
         {
-            FragLabel.Outside => Selection.Keep,
-            FragLabel.Inside => Selection.Drop,
-            FragLabel.OnSame => mesh == 0 ? Selection.Keep : Selection.Drop,
-            FragLabel.OnOpposite => Selection.Drop,
-            _ => throw new InvalidOperationException(),
+            for (var m = 0; m < SolidCount; m++)
+            {
+                if (m == mi) continue;
+                switch (m_pipeline.Label(f, m))
+                {
+                    case FragLabel.Outside: break;
+                    case FragLabel.Inside: return Selection.Drop;
+                    case FragLabel.OnSame: if (m < mi) return Selection.Drop; break;
+                    case FragLabel.OnOpposite: return Selection.Drop;
+                    default: throw new InvalidOperationException();
+                }
+            }
+            return Selection.Keep;
         });
 
-        /// <summary>Fragments of each solid inside the other; coincident same-facing regions kept once.</summary>
-        public PolyMesh[] Intersection() => Emit((mesh, label) => label switch
+        /// <summary>Boundary of the intersection of all solids.</summary>
+        public PolyMesh[] Intersection() => Emit((mi, f) =>
         {
-            FragLabel.Outside => Selection.Drop,
-            FragLabel.Inside => Selection.Keep,
-            FragLabel.OnSame => mesh == 0 ? Selection.Keep : Selection.Drop,
-            FragLabel.OnOpposite => Selection.Drop,
-            _ => throw new InvalidOperationException(),
+            for (var m = 0; m < SolidCount; m++)
+            {
+                if (m == mi) continue;
+                switch (m_pipeline.Label(f, m))
+                {
+                    case FragLabel.Outside: return Selection.Drop;
+                    case FragLabel.Inside: break;
+                    case FragLabel.OnSame: if (m < mi) return Selection.Drop; break;
+                    case FragLabel.OnOpposite: return Selection.Drop;
+                    default: throw new InvalidOperationException();
+                }
+            }
+            return Selection.Keep;
         });
 
-        /// <summary>A∖B: A outside B (plus A's faces where B touches from outside), B inside A flipped.</summary>
-        public PolyMesh[] Difference() => Emit(DifferenceSelect(0));
+        /// <summary>Boundary of solid 0 minus the union of all others.</summary>
+        public PolyMesh[] Difference() => Emit((mi, f) =>
+        {
+            if (mi == 0)
+            {
+                // survive iff no subtrahend covers or contains this piece
+                for (var m = 1; m < SolidCount; m++)
+                {
+                    switch (m_pipeline.Label(f, m))
+                    {
+                        case FragLabel.Outside: case FragLabel.OnOpposite: break;
+                        case FragLabel.Inside: case FragLabel.OnSame: return Selection.Drop;
+                        default: throw new InvalidOperationException();
+                    }
+                }
+                return Selection.Keep;
+            }
+            // subtrahend boundary: carved wall iff inside the minuend and not
+            // absorbed by any other subtrahend
+            if (m_pipeline.Label(f, 0) != FragLabel.Inside) return Selection.Drop;
+            for (var m = 1; m < SolidCount; m++)
+            {
+                if (m == mi) continue;
+                switch (m_pipeline.Label(f, m))
+                {
+                    case FragLabel.Outside: break;
+                    case FragLabel.OnSame: if (m < mi) return Selection.Drop; break;
+                    case FragLabel.Inside: case FragLabel.OnOpposite: return Selection.Drop;
+                    default: throw new InvalidOperationException();
+                }
+            }
+            return Selection.Flip;
+        });
 
         /// <summary>
-        /// Symmetric difference, emitted as the two lobes A∖B and B∖A. They
-        /// touch along the intersection curve, where a single merged surface
-        /// would be non-manifold — separate solids keep the manifold guarantee.
+        /// Symmetric difference (two solids only), emitted as the two lobes
+        /// A∖B and B∖A. They touch along the intersection curve, where a single
+        /// merged surface would be non-manifold — separate solids keep the
+        /// manifold guarantee.
         /// </summary>
-        public PolyMesh[] Xor() => Difference().Concat(Emit(DifferenceSelect(1))).ToArray();
-
-        private static Func<int, FragLabel, Selection> DifferenceSelect(int keptMesh) => (mesh, label) =>
+        public PolyMesh[] Xor()
         {
-            if (mesh == keptMesh)
-                return label switch
-                {
-                    FragLabel.Outside => Selection.Keep,
-                    FragLabel.Inside => Selection.Drop,
-                    FragLabel.OnSame => Selection.Drop,      // covered by the subtrahend from the same side
-                    FragLabel.OnOpposite => Selection.Keep,  // subtrahend only touches from outside
-                    _ => throw new InvalidOperationException(),
-                };
-            return label switch
+            if (SolidCount != 2) throw new NotSupportedException("Xor is defined for two solids");
+            return Difference().Concat(Emit((mi, f) =>
             {
-                FragLabel.Outside => Selection.Drop,
-                FragLabel.Inside => Selection.Flip,
-                FragLabel.OnSame => Selection.Drop,
-                FragLabel.OnOpposite => Selection.Drop,
-                _ => throw new InvalidOperationException(),
-            };
-        };
+                if (mi == 1)
+                    return m_pipeline.Label(f, 0) switch
+                    {
+                        FragLabel.Outside or FragLabel.OnOpposite => Selection.Keep,
+                        _ => Selection.Drop,
+                    };
+                return m_pipeline.Label(f, 1) == FragLabel.Inside ? Selection.Flip : Selection.Drop;
+            })).ToArray();
+        }
 
         private enum Selection { Drop, Keep, Flip }
 
-        private PolyMesh[] Emit(Func<int, FragLabel, Selection> select)
+        private PolyMesh[] Emit(Func<int, int, Selection> select)
         {
             var tris = new List<EmitTri>();
             for (var f = 0; f < m_pipeline.Fragments.Count; f++)
             {
                 var frag = m_pipeline.Fragments[f];
                 var mesh = m_kernel.TriMesh[frag.Parent];
-                switch (select(mesh, m_pipeline.Labels[f]))
+                switch (select(mesh, f))
                 {
                     case Selection.Drop: break;
                     case Selection.Keep: tris.Add(new EmitTri(frag.V0, frag.V1, frag.V2, frag.Parent)); break;
@@ -437,24 +481,30 @@ namespace Aardvark.Geometry
             }
         }
 
+        /// <summary>Channels usable for output: present in every source with the same element type, non-indexed everywhere.</summary>
         private static IEnumerable<(Symbol Name, Array[] Arrays)> CommonChannels(
             SymbolDict<Array>[] dicts, Symbol skip = default)
         {
             foreach (var name in dicts[0].Keys.ToArray())
             {
                 if (!name.IsPositive || name == skip) continue;
-                if (dicts[0].Contains(-name) || dicts[1].Contains(-name)) continue;
-                if (!dicts[0].TryGetValue(name, out var a0) || a0 == null) continue;
-                if (!dicts[1].TryGetValue(name, out var a1) || a1 == null) continue;
-                if (a0.GetType().GetElementType() != a1.GetType().GetElementType()) continue;
-                yield return (name, new[] { a0, a1 });
+                var arrays = new Array[dicts.Length];
+                var ok = true;
+                for (var m = 0; m < dicts.Length && ok; m++)
+                {
+                    ok = !dicts[m].Contains(-name)
+                        && dicts[m].TryGetValue(name, out var a) && a != null
+                        && a.GetType().GetElementType() == dicts[0][name].GetType().GetElementType();
+                    if (ok) arrays[m] = dicts[m][name];
+                }
+                if (ok) yield return (name, arrays);
             }
         }
 
         private static void EmitVertexAttributes(
             Kernel k, PolyMesh mesh, List<int> kernelOfLocal, int[] repParent, V3d[] repBary, PolyMesh[] sources)
         {
-            var dicts = new[] { sources[0].VertexAttributes, sources[1].VertexAttributes };
+            var dicts = sources.Map(src => src.VertexAttributes);
             foreach (var (name, arrays) in CommonChannels(dicts, PolyMesh.Property.Positions))
             {
                 var elementType = arrays[0].GetType().GetElementType()!;
@@ -477,7 +527,7 @@ namespace Aardvark.Geometry
         private static void EmitFaceAttributes(
             Kernel k, PolyMesh mesh, List<EmitTri> tris, PolyMesh[] sources)
         {
-            var dicts = new[] { sources[0].FaceAttributes, sources[1].FaceAttributes };
+            var dicts = sources.Map(src => src.FaceAttributes);
             foreach (var (name, arrays) in CommonChannels(dicts))
             {
                 var elementType = arrays[0].GetType().GetElementType()!;
@@ -495,30 +545,42 @@ namespace Aardvark.Geometry
             Kernel k, PolyMesh mesh, List<EmitTri> tris, PolyMesh[] sources)
         {
             // face-vertex channels may be indexed (name = values + -name = index)
-            // or per-slot; output is emitted in indexed form over the two
-            // sources' concatenated value arrays plus synthesized cut values
-            var dicts = new[] { sources[0].FaceVertexAttributes, sources[1].FaceVertexAttributes };
+            // or per-slot; output is emitted in indexed form over all sources'
+            // concatenated value arrays plus synthesized cut values
+            var dicts = sources.Map(src => src.FaceVertexAttributes);
             foreach (var name in dicts[0].Keys.ToArray())
             {
                 if (!name.IsPositive) continue;
-                if (!dicts[0].TryGetValue(name, out var v0) || v0 == null) continue;
-                if (!dicts[1].TryGetValue(name, out var v1) || v1 == null) continue;
-                var elementType = v0.GetType().GetElementType();
-                if (elementType == null || elementType != v1.GetType().GetElementType()) continue;
-                var idx = new[] { dicts[0].GetOrDefault(-name) as int[], dicts[1].GetOrDefault(-name) as int[] };
+                var values = new Array[sources.Length];
+                var idx = new int[sources.Length][];
+                var offsets = new int[sources.Length];
+                var elementType = default(Type);
+                var ok = true;
+                var baseLength = 0;
+                for (var m = 0; m < sources.Length && ok; m++)
+                {
+                    ok = dicts[m].TryGetValue(name, out var v) && v != null;
+                    if (!ok) break;
+                    elementType ??= v!.GetType().GetElementType();
+                    ok = elementType != null && elementType == v!.GetType().GetElementType();
+                    if (!ok) break;
+                    values[m] = v!;
+                    idx[m] = dicts[m].GetOrDefault(-name) as int[];
+                    offsets[m] = baseLength;
+                    baseLength += v!.Length;
+                }
+                if (!ok) continue;
                 var normalize = name == PolyMesh.Property.Normals;
 
                 var extra = new List<object>();
                 var indices = new int[tris.Count * 3];
-                var baseLength = v0.Length + v1.Length;
                 for (var i = 0; i < tris.Count; i++)
                 {
                     var t = tris[i];
                     var parent = t.Parent;
                     var mi = k.TriMesh[parent];
-                    var values = mi == 0 ? v0 : v1;
-                    var offset = mi == 0 ? 0 : v0.Length;
-                    int SlotValueIndex(int slot) => idx[mi] != null ? idx[mi]![slot] : slot;
+                    var offset = offsets[mi];
+                    int SlotValueIndex(int slot) => idx[mi] != null ? idx[mi][slot] : slot;
 
                     Span<int> corner = stackalloc int[] { t.V0, t.V1, t.V2 };
                     for (var c = 0; c < 3; c++)
@@ -530,7 +592,7 @@ namespace Aardvark.Geometry
                         else
                         {
                             var w = BarycentricOf(k, parent, k.Positions[corner[c]]);
-                            extra.Add(BaryValue(values,
+                            extra.Add(BaryValue(values[mi],
                                 SlotValueIndex(k.C0[parent]), SlotValueIndex(k.C1[parent]), SlotValueIndex(k.C2[parent]),
                                 w, normalize));
                             at = baseLength + extra.Count - 1;
@@ -539,9 +601,9 @@ namespace Aardvark.Geometry
                     }
                 }
 
-                var all = Array.CreateInstance(elementType, baseLength + extra.Count);
-                Array.Copy(v0, 0, all, 0, v0.Length);
-                Array.Copy(v1, 0, all, v0.Length, v1.Length);
+                var all = Array.CreateInstance(elementType!, baseLength + extra.Count);
+                for (var m = 0; m < sources.Length; m++)
+                    Array.Copy(values[m], 0, all, offsets[m], values[m].Length);
                 for (var e = 0; e < extra.Count; e++) all.SetValue(extra[e], baseLength + e);
 
                 mesh.FaceVertexAttributes[name] = all;

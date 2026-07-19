@@ -99,7 +99,7 @@ namespace Aardvark.Geometry.Tests
                 {
                     var fr = pipe.Fragments[f];
                     var ce = (kernel.Positions[fr.V0] + kernel.Positions[fr.V1] + kernel.Positions[fr.V2]) / 3;
-                    Console.WriteLine($"frag {f}: mesh {kernel.TriMesh[fr.Parent]} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) c ({ce.X:0.########},{ce.Y:0.###},{ce.Z:0.###}) {pipe.Labels[f]}");
+                    Console.WriteLine($"frag {f}: mesh {kernel.TriMesh[fr.Parent]} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) c ({ce.X:0.########},{ce.Y:0.###},{ce.Z:0.###}) {pipe.Label(f, 1 - kernel.TriMesh[fr.Parent])}");
                 }
                 for (var vi = 0; vi < kernel.Positions.Count; vi++)
                     Console.WriteLine($"vert {vi}: ({kernel.Positions[vi].X:0.#########},{kernel.Positions[vi].Y:0.#########},{kernel.Positions[vi].Z:0.#########}) gen {kernel.Generation[vi]}");
@@ -107,8 +107,8 @@ namespace Aardvark.Geometry.Tests
                 var kept = new System.Collections.Generic.List<int>();
                 for (var f = 0; f < pipe.Fragments.Count; f++)
                 {
-                    var l = pipe.Labels[f];
                     var mesh = kernel.TriMesh[pipe.Fragments[f].Parent];
+                    var l = pipe.Label(f, 1 - mesh);
                     if (l == FragLabel.Outside || (l == FragLabel.OnSame && mesh == 0)) kept.Add(f);
                 }
                 var dirCount = new System.Collections.Generic.Dictionary<(int, int), System.Collections.Generic.List<int>>();
@@ -125,6 +125,69 @@ namespace Aardvark.Geometry.Tests
                     Console.WriteLine($"DUP directed edge {kvp.Key}: frags {string.Join(",", kvp.Value)}");
                 try { Csg.Union(a, b); Console.WriteLine("union ok"); }
                 catch (Exception e2) { Console.WriteLine($"union FAIL: {e2.Message}"); }
+            }
+        }
+
+        [Test]
+        [Explicit]
+        public void NaryDump()
+        {
+            var a = CsgM0Tests.QuadBox(new Box3d(new V3d(0, 0, 0), new V3d(2, 2, 1)));
+            var holes = new[]
+            {
+                CsgM0Tests.QuadBox(new Box3d(new V3d(0.5, 0.5, -0.5), new V3d(1.25, 1.5, 1.5))),
+                CsgM0Tests.QuadBox(new Box3d(new V3d(0.75, 0.5, -0.5), new V3d(1.5, 1.5, 1.5))),
+            };
+            var kernel = new Kernel(new Eps(1e-11));
+            kernel.Ingest(a, 0);
+            kernel.Ingest(holes[0], 1);
+            kernel.Ingest(holes[1], 2);
+            var pipe = new Pipeline(kernel);
+            pipe.Run();
+            // emulate Difference selection and find open edges
+            var kept = new System.Collections.Generic.List<(int F, bool Flip)>();
+            for (var f = 0; f < pipe.Fragments.Count; f++)
+            {
+                var mi = kernel.TriMesh[pipe.Fragments[f].Parent];
+                if (mi == 0)
+                {
+                    var ok = true;
+                    for (var m = 1; m <= 2 && ok; m++)
+                        ok = pipe.Label(f, m) is FragLabel.Outside or FragLabel.OnOpposite;
+                    if (ok) kept.Add((f, false));
+                }
+                else
+                {
+                    if (pipe.Label(f, 0) != FragLabel.Inside) continue;
+                    var other = mi == 1 ? 2 : 1;
+                    var l = pipe.Label(f, other);
+                    var ok = l == FragLabel.Outside || (l == FragLabel.OnSame && other > mi);
+                    if (ok) kept.Add((f, true));
+                }
+            }
+            var dir = new System.Collections.Generic.Dictionary<(int, int), int>();
+            foreach (var (f, flip) in kept)
+            {
+                var fr = pipe.Fragments[f];
+                var (v0, v1, v2) = flip ? (fr.V0, fr.V2, fr.V1) : (fr.V0, fr.V1, fr.V2);
+                foreach (var (u, v) in new[] { (v0, v1), (v1, v2), (v2, v0) })
+                    dir[(u, v)] = f;
+            }
+            foreach (var kvp in dir)
+            {
+                var (u, v) = kvp.Key;
+                if (dir.ContainsKey((v, u))) continue;
+                Console.WriteLine($"OPEN {u}->{v}: {kernel.Positions[u]} -> {kernel.Positions[v]} (frag {kvp.Value})");
+                // print fragments touching this edge
+                for (var f = 0; f < pipe.Fragments.Count; f++)
+                {
+                    var fr = pipe.Fragments[f];
+                    var vs = new[] { fr.V0, fr.V1, fr.V2 };
+                    if (!vs.Contains(u) || !vs.Contains(v)) continue;
+                    var mi = kernel.TriMesh[fr.Parent];
+                    Console.WriteLine($"   frag {f} mesh {mi} verts ({fr.V0},{fr.V1},{fr.V2}) " +
+                        $"labels [{pipe.Label(f, 0)},{pipe.Label(f, 1)},{pipe.Label(f, 2)}]");
+                }
             }
         }
 
