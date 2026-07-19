@@ -150,86 +150,13 @@ namespace Aardvark.Geometry
         {
             if (tris.Count == 0) return Array.Empty<PolyMesh>();
 
-            var componentOfFace = new int[tris.Count];
-            var componentCount = MeshAwareComponents(k, tris, componentOfFace);
+            // 1. halfedge pairing: normal edges pair their two faces; at edges
+            //    where more triangles meet (result volumes touching along a
+            //    curve), faces are paired by dihedral angle into solid wedges
+            var pair = PairHalfedges(k, tris);
 
-            var result = new PolyMesh[componentCount];
-            for (var ci = 0; ci < componentCount; ci++)
-            {
-                var componentTris = new List<EmitTri>();
-                for (var i = 0; i < tris.Count; i++)
-                    if (componentOfFace[i] == ci) componentTris.Add(tris[i]);
-                result[ci] = BuildPolyMesh(k, componentTris, sources, verify);
-            }
-            return result;
-        }
-
-        /// <summary>
-        /// Edge-connected components of the selected triangles. At edges where
-        /// more than two triangles meet (result volumes touching along a
-        /// curve), incident faces are paired by dihedral angle: sorted around
-        /// the edge axis, a face traversing the edge v→u followed (CCW) by one
-        /// traversing u→v bound one solid wedge and are connected. Touching
-        /// volumes thus separate into individually manifold components instead
-        /// of one non-manifold soup.
-        /// </summary>
-        private static int MeshAwareComponents(Kernel k, List<EmitTri> tris, int[] componentOfFace)
-        {
-            var edgeTris = new Dictionary<(int, int), List<int>>();
-            for (var i = 0; i < tris.Count; i++)
-            {
-                var t = tris[i];
-                foreach (var e in new[] { Key(t.V0, t.V1), Key(t.V1, t.V2), Key(t.V2, t.V0) })
-                    edgeTris.GetOrCreate(e, _ => new List<int>()).Add(i);
-            }
-            static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
-
-            var adjacency = new List<int>[tris.Count].SetByIndex(_ => new List<int>());
-            foreach (var (edge, list) in edgeTris)
-            {
-                if (list.Count == 2)
-                {
-                    adjacency[list[0]].Add(list[1]);
-                    adjacency[list[1]].Add(list[0]);
-                }
-                else if (list.Count > 2)
-                {
-                    var (u, v) = edge;
-                    var d = (k.Positions[v] - k.Positions[u]).Normalized;
-                    var ax0 = d.X.Abs() < 0.9 ? V3d.XAxis : V3d.YAxis;
-                    var ax1 = d.Cross(ax0).Normalized;
-                    var ax2 = d.Cross(ax1);
-
-                    // per incident face: angle of its third vertex around the
-                    // edge axis, and whether it traverses the edge u->v
-                    var around = list.Map(i =>
-                    {
-                        var t = tris[i];
-                        var w = t.V0 != u && t.V0 != v ? t.V0 : t.V1 != u && t.V1 != v ? t.V1 : t.V2;
-                        var r = k.Positions[w] - k.Positions[u];
-                        var angle = Fun.Atan2(r.Dot(ax2), r.Dot(ax1));
-                        var forward = (t.V0 == u && t.V1 == v) || (t.V1 == u && t.V2 == v) || (t.V2 == u && t.V0 == v);
-                        return (Tri: i, Angle: angle, Forward: forward);
-                    }).ToArray();
-                    Array.Sort(around, (x, y) => x.Angle.CompareTo(y.Angle));
-
-                    for (var i = 0; i < around.Length; i++)
-                    {
-                        var a = around[i];
-                        var b = around[(i + 1) % around.Length];
-                        if (!a.Forward && b.Forward)
-                        {
-                            adjacency[a.Tri].Add(b.Tri);
-                            adjacency[b.Tri].Add(a.Tri);
-                        }
-                        // other consecutive combinations either bound void
-                        // sectors or indicate genuinely broken input; the
-                        // per-component verifier reports the latter
-                    }
-                }
-            }
-
-            componentOfFace.Set(-1);
+            // 2. components = connectivity through paired halfedges
+            var componentOfFace = new int[tris.Count].Set(-1);
             var componentCount = 0;
             var stack = new Stack<int>();
             for (var seed = 0; seed < tris.Count; seed++)
@@ -241,34 +168,144 @@ namespace Aardvark.Geometry
                 while (stack.Count > 0)
                 {
                     var i = stack.Pop();
-                    foreach (var j in adjacency[i])
-                        if (componentOfFace[j] < 0) { componentOfFace[j] = ci; stack.Push(j); }
+                    for (var slot = 0; slot < 3; slot++)
+                    {
+                        var p = pair[i * 3 + slot].Tri;
+                        if (p >= 0 && componentOfFace[p] < 0) { componentOfFace[p] = ci; stack.Push(p); }
+                    }
                 }
             }
-            return componentCount;
+
+            // 3. manifold sheet extraction: group each kernel vertex's incident
+            //    corners by link-connectivity through paired halfedges and emit
+            //    one output vertex per group — a solid pinched along an edge or
+            //    at a vertex (self-touching result) becomes combinatorially
+            //    manifold with geometrically coincident vertices; for clean
+            //    meshes this reduces to plain vertex compaction
+            var cornerGroup = new int[tris.Count * 3].SetByIndex(i => i);
+            int Find(int i) { while (cornerGroup[i] != i) { cornerGroup[i] = cornerGroup[cornerGroup[i]]; i = cornerGroup[i]; } return i; }
+            void Union(int i, int j)
+            {
+                var ri = Find(i); var rj = Find(j);
+                if (ri != rj) cornerGroup[ri.Max(rj)] = ri.Min(rj);
+            }
+            static int Corner(EmitTri t, int c) => c == 0 ? t.V0 : c == 1 ? t.V1 : t.V2;
+            static int CornerOf(EmitTri t, int vid) => t.V0 == vid ? 0 : t.V1 == vid ? 1 : 2;
+            for (var i = 0; i < tris.Count; i++)
+            {
+                for (var slot = 0; slot < 3; slot++)
+                {
+                    var (pt, _) = pair[i * 3 + slot];
+                    if (pt < 0) continue;
+                    var u = Corner(tris[i], slot);
+                    var v = Corner(tris[i], (slot + 1) % 3);
+                    Union(i * 3 + slot, pt * 3 + CornerOf(tris[pt], u));
+                    Union(i * 3 + (slot + 1) % 3, pt * 3 + CornerOf(tris[pt], v));
+                }
+            }
+
+            var result = new PolyMesh[componentCount];
+            for (var ci = 0; ci < componentCount; ci++)
+            {
+                var componentTris = new List<int>();
+                for (var i = 0; i < tris.Count; i++)
+                    if (componentOfFace[i] == ci) componentTris.Add(i);
+                result[ci] = BuildPolyMesh(k, tris, componentTris, Find, sources, verify);
+            }
+            return result;
         }
 
-        private static PolyMesh BuildPolyMesh(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
+        /// <summary>
+        /// Per halfedge (tri, edge slot): the paired (tri, slot) across that
+        /// edge, or (-1,-1). Multi-edges are paired by dihedral angle: sorted
+        /// CCW around the edge axis, a face traversing v→u followed by one
+        /// traversing u→v bound one solid wedge. Angle ties are coplanar
+        /// continuations and ordered v→u first so they pair like a zero-angle
+        /// wedge.
+        /// </summary>
+        private static (int Tri, int Slot)[] PairHalfedges(Kernel k, List<EmitTri> tris)
         {
-            var triCount = tris.Count;
-            var localOfKernel = new Dictionary<int, int>();
+            var pair = new (int Tri, int Slot)[tris.Count * 3].Set((-1, -1));
+            var edgeTris = new Dictionary<(int, int), List<(int Tri, int Slot)>>();
+            static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
+            static int Corner(EmitTri t, int c) => c == 0 ? t.V0 : c == 1 ? t.V1 : t.V2;
+            for (var i = 0; i < tris.Count; i++)
+                for (var slot = 0; slot < 3; slot++)
+                    edgeTris.GetOrCreate(Key(Corner(tris[i], slot), Corner(tris[i], (slot + 1) % 3)),
+                        _ => new List<(int, int)>()).Add((i, slot));
+
+            void Pair((int Tri, int Slot) a, (int Tri, int Slot) b)
+            {
+                pair[a.Tri * 3 + a.Slot] = b;
+                pair[b.Tri * 3 + b.Slot] = a;
+            }
+
+            foreach (var (edge, list) in edgeTris)
+            {
+                if (list.Count == 2)
+                {
+                    Pair(list[0], list[1]);
+                }
+                else if (list.Count > 2)
+                {
+                    var (u, v) = edge;
+                    var d = (k.Positions[v] - k.Positions[u]).Normalized;
+                    var ax0 = d.X.Abs() < 0.9 ? V3d.XAxis : V3d.YAxis;
+                    var ax1 = d.Cross(ax0).Normalized;
+                    var ax2 = d.Cross(ax1);
+                    var around = list.Map(h =>
+                    {
+                        var t = tris[h.Tri];
+                        var w = t.V0 != u && t.V0 != v ? t.V0 : t.V1 != u && t.V1 != v ? t.V1 : t.V2;
+                        var r = k.Positions[w] - k.Positions[u];
+                        var angle = Fun.Atan2(r.Dot(ax2), r.Dot(ax1));
+                        var forward = Corner(tris[h.Tri], h.Slot) == u;
+                        return (H: h, Angle: angle, Forward: forward);
+                    }).ToArray();
+                    Array.Sort(around, (x, y) =>
+                        (x.Angle - y.Angle).Abs() < 1e-9
+                            ? x.Forward.CompareTo(y.Forward)
+                            : x.Angle.CompareTo(y.Angle));
+                    for (var i = 0; i < around.Length; i++)
+                    {
+                        var a = around[i];
+                        var b = around[(i + 1) % around.Length];
+                        if (!a.Forward && b.Forward) Pair(a.H, b.H);
+                        // other consecutive combinations bound void sectors, or
+                        // indicate broken geometry (the verifier reports those)
+                    }
+                }
+            }
+            return pair;
+        }
+
+        private static PolyMesh BuildPolyMesh(
+            Kernel k, List<EmitTri> allTris, List<int> triIndices, Func<int, int> cornerGroupOf,
+            PolyMesh[] sources, bool verify)
+        {
+            var triCount = triIndices.Count;
+            var tris = triIndices.Map(i => allTris[i]).ToList();
+
+            // one output vertex per corner group
+            var localOfGroup = new Dictionary<int, int>();
             var kernelOfLocal = new List<int>();
             var via = new int[triCount * 3];
             var fia = new int[triCount + 1];
             for (var i = 0; i < triCount; i++)
             {
+                var ti = triIndices[i];
                 fia[i + 1] = (i + 1) * 3;
-                via[i * 3] = Local(tris[i].V0);
-                via[i * 3 + 1] = Local(tris[i].V1);
-                via[i * 3 + 2] = Local(tris[i].V2);
-            }
-            int Local(int vi)
-            {
-                if (localOfKernel.TryGetValue(vi, out var li)) return li;
-                li = kernelOfLocal.Count;
-                localOfKernel[vi] = li;
-                kernelOfLocal.Add(vi);
-                return li;
+                for (var c = 0; c < 3; c++)
+                {
+                    var group = cornerGroupOf(ti * 3 + c);
+                    if (!localOfGroup.TryGetValue(group, out var li))
+                    {
+                        li = kernelOfLocal.Count;
+                        localOfGroup[group] = li;
+                        kernelOfLocal.Add(c == 0 ? tris[i].V0 : c == 1 ? tris[i].V1 : tris[i].V2);
+                    }
+                    via[i * 3 + c] = li;
+                }
             }
 
             var positions = new V3d[kernelOfLocal.Count];
@@ -279,14 +316,14 @@ namespace Aardvark.Geometry
             // channel synthesis
             var repParent = new int[kernelOfLocal.Count].Set(-1);
             var repBary = new V3d[kernelOfLocal.Count];
-            foreach (var t in tris)
+            for (var i = 0; i < triCount; i++)
             {
-                foreach (var vid in new[] { t.V0, t.V1, t.V2 })
+                for (var c = 0; c < 3; c++)
                 {
-                    var li = localOfKernel[vid];
+                    var li = via[i * 3 + c];
                     if (repParent[li] >= 0) continue;
-                    repParent[li] = t.Parent;
-                    repBary[li] = Barycentric(k, t.Parent, k.Positions[vid]);
+                    repParent[li] = tris[i].Parent;
+                    repBary[li] = Barycentric(k, tris[i].Parent, k.Positions[kernelOfLocal[li]]);
                 }
             }
 

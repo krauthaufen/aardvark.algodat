@@ -5,12 +5,13 @@ using System.Linq;
 
 namespace Aardvark.Geometry.Tests
 {
+    /// <summary>Manual tools: big fuzz sweep and perf measurement (Explicit).</summary>
     [TestFixture]
     public class CsgScratch
     {
         [Test]
         [Explicit]
-        public void Dump()
+        public void BigFuzz()
         {
             var fails = 0; var total = 0;
             void Check(PolyMesh a, PolyMesh b, string ctx)
@@ -65,6 +66,22 @@ namespace Aardvark.Geometry.Tests
             }
             Console.WriteLine($"BIGFUZZ done: {fails} failures / {total} configs");
             Assert.That(fails, Is.EqualTo(0));
+        }
+
+        [Test]
+        [Explicit]
+        public void Perf()
+        {
+            foreach (var sub in new[] { 4, 5, 6 })
+            {
+                var a = CsgM5Tests.Icosphere(V3d.Zero, 1.0, sub);
+                var b = CsgM5Tests.Icosphere(new V3d(0.8, 0.3, 0.2), 1.0, sub);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var union = Csg.Union(a, b);
+                sw.Stop();
+                var tris = (a.FirstIndexArray.Length - 1) * 2;
+                Console.WriteLine($"PERF union {tris} tris: {sw.ElapsedMilliseconds} ms ({union.Sum(m => m.FirstIndexArray.Length - 1)} out tris)");
+            }
         }
     }
 }
