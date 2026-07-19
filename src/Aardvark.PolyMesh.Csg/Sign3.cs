@@ -52,7 +52,7 @@ namespace Aardvark.Geometry
         /// here. At the default eps this bounds derived-point tolerances to
         /// ~1e-7 of the scene scale.
         /// </summary>
-        public const double MaxFactor = 4096.0;
+        public const double MaxFactor = 1e5;
 
         public Eps(double relative, double scene = 0.0)
         {

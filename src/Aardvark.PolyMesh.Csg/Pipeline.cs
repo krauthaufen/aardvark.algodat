@@ -119,6 +119,8 @@ namespace Aardvark.Geometry
             Lap("weld");
             var pairs = BroadPhase();
             Lap($"broadphase ({pairs.Count} pairs)");
+            WeldPlanes(pairs);
+            Lap("planeweld");
             // symbolic pair results in parallel (pure sign/interval math),
             // materialization (ids, welding, constraint registration) in
             // deterministic pair order
@@ -306,6 +308,89 @@ namespace Aardvark.Geometry
 
         #endregion
 
+        #region plane welding
+
+        /// <summary>plane id → welded group id</summary>
+        private int[] m_planeGroup = Array.Empty<int>();
+
+        /// <summary>
+        /// Globally welds near-coincident planes (canonicalize first, decide
+        /// later): candidate plane pairs come from the broad-phase triangle
+        /// pairs; two planes weld when all six vertices lie within the
+        /// PlaneWeldFactor tolerance slab of the other plane. Welded planes
+        /// snap to the group representative's geometry (orientation-aligned
+        /// per face), so every affected pair becomes exactly coplanar and is
+        /// handled by the coplanar machinery — consistently across all faces,
+        /// which per-pair escalation cannot guarantee.
+        /// </summary>
+        private void WeldPlanes(List<(int, int)> pairs)
+        {
+            var n = m_kernel.Planes.Count;
+            var parent = new int[n].SetByIndex(i => i);
+            int Find(int i) { while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; }
+
+            foreach (var (ta, tb) in pairs)
+            {
+                var pa = m_kernel.TriPlane[ta];
+                var pb = m_kernel.TriPlane[tb];
+                var ra = Find(pa); var rb = Find(pb);
+                if (ra == rb) continue;
+
+                var qa = m_kernel.Planes[pa];
+                var qb = m_kernel.Planes[pb];
+                // face-relative criterion: separation ≤ K·L (K tied to the
+                // conditioning cap so faces are either weldable or their cuts
+                // resolvable) plus the absolute eps floor — NOT scene-relative
+                // (a scene-relative slab would weld distinct planes at large
+                // offsets)
+                Span<int> wa = stackalloc int[] { m_kernel.T0[ta], m_kernel.T1[ta], m_kernel.T2[ta] };
+                Span<int> wb = stackalloc int[] { m_kernel.T0[tb], m_kernel.T1[tb], m_kernel.T2[tb] };
+                var l = 0.0;
+                var mag = 0.0;
+                for (var i = 0; i < 3; i++)
+                {
+                    var qai = m_kernel.Positions[wa[i]];
+                    var qbi = m_kernel.Positions[wb[i]];
+                    l = l.Max((qai - m_kernel.Positions[wa[(i + 1) % 3]]).NormMax)
+                         .Max((qbi - m_kernel.Positions[wb[(i + 1) % 3]]).NormMax);
+                    mag = mag.Max(qai.NormMax).Max(qbi.NormMax);
+                }
+                var limit = 8.0 * l / Eps.MaxFactor
+                    + Eps.GenerationFactor * m_eps.Relative * (mag + m_eps.Scene);
+                var weld = true;
+                for (var i = 0; i < 3 && weld; i++)
+                {
+                    weld = (qb.Normal.Dot(m_kernel.Positions[wa[i]]) - qb.Distance).Abs() <= limit
+                        && (qa.Normal.Dot(m_kernel.Positions[wb[i]]) - qa.Distance).Abs() <= limit;
+                }
+                if (!weld) continue;
+
+                if (ra < rb) parent[rb] = ra; else parent[ra] = rb;
+            }
+
+            m_planeGroup = new int[n];
+            for (var i = 0; i < n; i++)
+            {
+                var r = Find(i);
+                m_planeGroup[i] = r;
+                if (r == i) continue;
+                // snap to the representative's geometry, orientation-aligned
+                var canon = m_kernel.Planes[r];
+                m_kernel.Planes[i] = m_kernel.Planes[i].Normal.Dot(canon.Normal) >= 0
+                    ? canon
+                    : new Plane3d(-canon.Normal, -canon.Distance);
+            }
+        }
+
+        /// <summary>Geometric winding normal of a kernel triangle (not normalized).</summary>
+        private V3d WindingNormal(int t)
+        {
+            var p0 = m_kernel.Positions[m_kernel.T0[t]];
+            return (m_kernel.Positions[m_kernel.T1[t]] - p0).Cross(m_kernel.Positions[m_kernel.T2[t]] - p0);
+        }
+
+        #endregion
+
         #region classification cache
 
         // NOTE: no cache — HeightSign is pure and deterministic, so
@@ -399,6 +484,16 @@ namespace Aardvark.Geometry
 
             Span<int> va = stackalloc int[] { m_kernel.T0[ta], m_kernel.T1[ta], m_kernel.T2[ta] };
             Span<int> vb = stackalloc int[] { m_kernel.T0[tb], m_kernel.T1[tb], m_kernel.T2[tb] };
+
+            // welded planes: the pair is coplanar by canonicalization —
+            // orientation from the geometric windings (a welded face's plane
+            // may be snapped against its winding)
+            if (m_planeGroup[pa] == m_planeGroup[pb])
+            {
+                if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
+                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0);
+            }
+
             Span<Sign3> sb = stackalloc Sign3[3];
             Span<Sign3> sa = stackalloc Sign3[3];
             for (var i = 0; i < 3; i++) sb[i] = Sign(pa, vb[i]);
@@ -409,7 +504,7 @@ namespace Aardvark.Geometry
             if (AllOn(sa) && AllOn(sb))
             {
                 if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
-                return new PairResult(m_kernel.Planes[pa].Normal.Dot(m_kernel.Planes[pb].Normal) > 0);
+                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0);
             }
 
             var crossA = CrossingPoints(va, sa, pb);
@@ -436,6 +531,13 @@ namespace Aardvark.Geometry
                 case PairKind.Coplanar:
                     m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, r.CoplanarSame));
                     m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, r.CoplanarSame));
+                    // the coverage outline must be explicit constraints: for
+                    // exactly-coplanar faces the side-face pairs provide the
+                    // curves, but welded (approximately coplanar) faces need
+                    // the outline itself, and it must weld consistently with
+                    // the neighboring real cuts
+                    AddCoplanarOutline(ta, tb);
+                    AddCoplanarOutline(tb, ta);
                     return;
                 case PairKind.Segment:
                     var v0 = Materialize(r.Lo, r.LoCutPlane);
@@ -450,6 +552,67 @@ namespace Aardvark.Geometry
 
         private static bool AllStrict(Span<Sign3> s, Sign3 v) => s[0] == v && s[1] == v && s[2] == v;
         private static bool AllOn(Span<Sign3> s) => s[0] == Sign3.On && s[1] == Sign3.On && s[2] == Sign3.On;
+
+        /// <summary>
+        /// Clips each edge of tb to triangle ta in the shared plane and adds
+        /// the clipped segments as constraints on ta. Clip points are created
+        /// with the tolerance-factor cap (they live on welded planes) and are
+        /// registered on tb's edges so both sides subdivide consistently.
+        /// </summary>
+        private void AddCoplanarOutline(int ta, int tb)
+        {
+            var normal = m_kernel.Planes[m_kernel.TriPlane[ta]].Normal;
+            Span<int> va = stackalloc int[] { m_kernel.T0[ta], m_kernel.T1[ta], m_kernel.T2[ta] };
+            Span<V2d> a2 = stackalloc V2d[3];
+            for (var i = 0; i < 3; i++) a2[i] = Triangulator.ProjectDominant(normal, m_kernel.Positions[va[i]]);
+            // orient CCW for inside-is-left clipping
+            var det = (a2[1] - a2[0]).X * (a2[2] - a2[0]).Y - (a2[1] - a2[0]).Y * (a2[2] - a2[0]).X;
+            if (det == 0) return;
+            if (det < 0) { (a2[1], a2[2]) = (a2[2], a2[1]); (va[1], va[2]) = (va[2], va[1]); }
+
+            Span<int> vb = stackalloc int[] { m_kernel.T0[tb], m_kernel.T1[tb], m_kernel.T2[tb] };
+            for (var e = 0; e < 3; e++)
+            {
+                var u = vb[e]; var v = vb[(e + 1) % 3];
+                var pu = Triangulator.ProjectDominant(normal, m_kernel.Positions[u]);
+                var pv = Triangulator.ProjectDominant(normal, m_kernel.Positions[v]);
+                var t0 = 0.0; var t1 = 1.0;
+                for (var i = 0; i < 3 && t0 < t1; i++)
+                {
+                    var p = a2[i]; var q = a2[(i + 1) % 3];
+                    var d = q - p;
+                    var du = d.X * (pu.Y - p.Y) - d.Y * (pu.X - p.X);
+                    var dv = d.X * (pv.Y - p.Y) - d.Y * (pv.X - p.X);
+                    if (du < 0 && dv < 0) { t0 = 1; t1 = 0; break; }
+                    if (du < 0) t0 = t0.Max(du / (du - dv));
+                    else if (dv < 0) t1 = t1.Min(du / (du - dv));
+                }
+                if (t1 - t0 <= 1e-9) continue;
+
+                var w0 = OutlinePoint(u, v, t0);
+                var w1 = OutlinePoint(u, v, t1);
+                if (w0 != w1) AddConstraint(ta, w0, w1);
+            }
+        }
+
+        private int OutlinePoint(int u, int v, double t)
+        {
+            if (t <= 0) return u;
+            if (t >= 1) return v;
+            var p = m_kernel.Positions[u] + t * (m_kernel.Positions[v] - m_kernel.Positions[u]);
+            if (m_eps.AreCoincident(p, m_kernel.Positions[u], Eps.MaxFactor)) return u;
+            if (m_eps.AreCoincident(p, m_kernel.Positions[v], Eps.MaxFactor)) return v;
+            var vid = GridFindCoincident(p, Eps.MaxFactor);
+            if (vid < 0)
+            {
+                vid = m_kernel.Positions.Count;
+                m_kernel.Positions.Add(p);
+                m_kernel.TolFactor.Add(Eps.MaxFactor);
+                GridAdd(vid);
+            }
+            RegisterEdgePoint(u, v, vid);
+            return vid;
+        }
 
         /// <summary>2D separating-edge test for two coplanar triangles; touching along boundary counts as not overlapping.</summary>
         private bool CoplanarInteriorsOverlap(Span<int> va, Span<int> vb, int plane)
@@ -730,8 +893,8 @@ namespace Aardvark.Geometry
                 var normal = m_kernel.Planes[m_kernel.TriPlane[tri]].Normal;
                 var segs = new List<(int, int)>(constraints).ToArray();
 
-                // (1) proper crossings within this face
-                if (m_kernel.MeshCount > 2)
+                // (1) proper crossings within this face (outline constraints
+                // can cross ordinary segments even with two solids)
                 {
                     for (var i = 0; i < segs.Length; i++)
                     {
