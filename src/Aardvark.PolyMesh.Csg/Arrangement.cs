@@ -302,6 +302,9 @@ namespace Aardvark.Geometry
             var sw = Environment.GetEnvironmentVariable("CSG_PERF") != null
                 ? System.Diagnostics.Stopwatch.StartNew() : null;
 
+            tris = CancelCoincidentFaces(tris);
+            if (tris.Count == 0) return Array.Empty<CsgMesh>();
+
             // 1. halfedge pairing: normal edges pair their two faces; at edges
             //    where more triangles meet (result volumes touching along a
             //    curve), faces are paired by dihedral angle into solid wedges
@@ -367,6 +370,73 @@ namespace Aardvark.Geometry
             }
             if (sw != null) Console.WriteLine($"PERF emit-build+verify ({tris.Count} tris): {sw.Elapsed.TotalMilliseconds:0.0} ms");
             return result;
+        }
+
+        /// <summary>
+        /// Cancels coincident faces in the selected set (the boolean
+        /// coincident-face resolution step). Two selected fragments on the
+        /// same three kernel vertices with opposite winding enclose zero
+        /// volume — an anti-face flap that can only produce non-manifold
+        /// edges; same-winding coincident copies are redundant. Each group of
+        /// coincident fragments (identical vertex triple) is reduced to a
+        /// single representative in the direction of the net signed count, or
+        /// dropped entirely when the net is zero. A valid closed manifold
+        /// never carries two faces on the same triple, so this is always
+        /// safe. The cross-mesh OnSame/OnOpposite selection rules only see
+        /// coincidence between different meshes; anti-faces arising within one
+        /// mesh (coincident input faces, or arrangement-induced coincidence)
+        /// are caught here.
+        /// </summary>
+        private static List<EmitTri> CancelCoincidentFaces(List<EmitTri> tris)
+        {
+            // key: sorted vertex triple -> (net orientation, representative fragment)
+            var groups = new Dictionary<(int, int, int), (int Net, int Rep, bool RepPositive)>();
+            var counts = new Dictionary<(int, int, int), int>();
+            for (var i = 0; i < tris.Count; i++)
+            {
+                var t = tris[i];
+                if (t.V0 == t.V1 || t.V1 == t.V2 || t.V2 == t.V0) continue; // degenerate — skip
+                var key = SortedTriple(t.V0, t.V1, t.V2, out var positive);
+                counts.TryGetValue(key, out var c);
+                counts[key] = c + 1;
+                if (!groups.TryGetValue(key, out var g))
+                    groups[key] = (positive ? 1 : -1, i, positive);
+                else
+                {
+                    var net = g.Net + (positive ? 1 : -1);
+                    // keep the lowest-index representative matching the (running) net sign
+                    var rep = g.Rep; var repPos = g.RepPositive;
+                    if (net != 0 && (net > 0) != repPos) { rep = i; repPos = net > 0; }
+                    groups[key] = (net, rep, repPos);
+                }
+            }
+            // fast path: no coincident groups at all
+            var anyCoincident = false;
+            foreach (var c in counts.Values) if (c > 1) { anyCoincident = true; break; }
+            if (!anyCoincident) return tris;
+
+            var result = new List<EmitTri>(tris.Count);
+            for (var i = 0; i < tris.Count; i++)
+            {
+                var t = tris[i];
+                if (t.V0 == t.V1 || t.V1 == t.V2 || t.V2 == t.V0) continue;
+                var key = SortedTriple(t.V0, t.V1, t.V2, out _);
+                if (counts[key] == 1) { result.Add(t); continue; }
+                var g = groups[key];
+                if (g.Net != 0 && i == g.Rep) result.Add(t); // one representative of the net orientation
+            }
+            return result;
+        }
+
+        /// <summary>Sorted (ascending) vertex triple plus whether (a,b,c) is an even permutation of it.</summary>
+        private static (int, int, int) SortedTriple(int a, int b, int c, out bool positive)
+        {
+            var swaps = 0;
+            if (a > b) { (a, b) = (b, a); swaps++; }
+            if (b > c) { (b, c) = (c, b); swaps++; }
+            if (a > b) { (a, b) = (b, a); swaps++; }
+            positive = (swaps & 1) == 0;
+            return (a, b, c);
         }
 
         /// <summary>
