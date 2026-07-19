@@ -59,16 +59,19 @@ namespace Aardvark.Geometry
         /// triangulates polygonal faces by ear clipping, and appends everything
         /// to the kernel arrays.
         /// </summary>
-        public void Ingest(PolyMesh mesh, int meshIndex)
+        public void Ingest(PolyMesh mesh, int meshIndex, bool verify = true)
         {
             var fia = mesh.FirstIndexArray ?? throw new CsgInputException("mesh has no FirstIndexArray");
             var via = mesh.VertexIndexArray ?? throw new CsgInputException("mesh has no VertexIndexArray");
             var pos = mesh.PositionArray ?? throw new CsgInputException("mesh has no PositionArray");
             var faceCount = fia.Length - 1;
 
-            var violation = ManifoldChecks.FindManifoldViolation(fia, via, pos.Length);
-            if (violation != null)
-                throw new CsgInputException($"input mesh {meshIndex} is not a closed manifold: {violation}");
+            if (verify)
+            {
+                var violation = ManifoldChecks.FindManifoldViolation(fia, via, pos.Length);
+                if (violation != null)
+                    throw new CsgInputException($"input mesh {meshIndex} is not a closed manifold: {violation}");
+            }
 
             if (meshIndex != MeshCount)
                 throw new ArgumentException($"meshes must be ingested in order (got index {meshIndex}, expected {MeshCount})");

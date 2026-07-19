@@ -53,10 +53,9 @@ namespace Aardvark.Geometry
         {
             if (solids.Length < 2) throw new ArgumentException("need at least two solids");
             var o = options ?? CsgOptions.Default;
-            if (o.Verification == CsgVerification.None)
-                throw new NotSupportedException("verification cannot be disabled in v0");
             var kernel = new Kernel(new Eps(o.RelativeEpsilon));
-            for (var i = 0; i < solids.Length; i++) kernel.Ingest(solids[i], i);
+            for (var i = 0; i < solids.Length; i++)
+                kernel.Ingest(solids[i], i, verify: o.Verification != CsgVerification.None);
             var pipeline = new Pipeline(kernel);
             pipeline.Run();
             return new CsgArrangement(kernel, pipeline, solids, o);

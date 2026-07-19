@@ -220,6 +220,20 @@ namespace Aardvark.Geometry.Tests
 
         [Test]
         [Explicit]
+        public void PerfPrepared()
+        {
+            var a = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(V3d.Zero, 1.0, 6));
+            var b = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(new V3d(0.8, 0.3, 0.2), 1.0, 6));
+            Csg.Union(a, b); // warmup + BVH cache
+            Environment.SetEnvironmentVariable("CSG_PERF", "1");
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Csg.Union(a, b);
+            Console.WriteLine($"TOTAL prepared union 2x81920 tris: {sw.ElapsedMilliseconds} ms");
+            Environment.SetEnvironmentVariable("CSG_PERF", null);
+        }
+
+        [Test]
+        [Explicit]
         public void PerfStages()
         {
             Environment.SetEnvironmentVariable("CSG_PERF", "1");

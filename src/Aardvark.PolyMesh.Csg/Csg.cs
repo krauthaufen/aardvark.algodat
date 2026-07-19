@@ -18,11 +18,11 @@ namespace Aardvark.Geometry
 
     public enum CsgVerification
     {
-        /// <summary>Verify inputs only.</summary>
+        /// <summary>Verify inputs only; outputs are trusted (manifold by construction).</summary>
         InputOnly,
         /// <summary>Verify inputs and every output component (default).</summary>
         Full,
-        /// <summary>Reserved; not supported in v0.</summary>
+        /// <summary>No verification at all — for production pipelines over already-trusted (prepared) solids.</summary>
         None,
     }
 

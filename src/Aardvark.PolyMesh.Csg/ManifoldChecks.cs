@@ -42,6 +42,8 @@ namespace Aardvark.Geometry
         public static string? FindManifoldViolation(int[] fia, int[] via, int vertexCount)
         {
             var faceCount = fia.Length - 1;
+            if (via.Length == faceCount * 3 && (faceCount == 0 || fia[1] == 3))
+                return FindManifoldViolationTriangles(via, vertexCount);
             var errors = new List<string>();
             void Err(string e) { if (errors.Count < 8) errors.Add(e); }
 
@@ -125,6 +127,80 @@ namespace Aardvark.Geometry
                 }
             }
             return errors.Count > 0 ? string.Join("; ", errors) : null;
+        }
+
+        /// <summary>
+        /// Triangle fast path: twin matching via one sort instead of
+        /// dictionaries (hot: runs on every boolean output component).
+        /// </summary>
+        private static string? FindManifoldViolationTriangles(int[] via, int vertexCount)
+        {
+            var h = via.Length; // halfedge count
+            for (var i = 0; i < h; i++)
+                if ((uint)via[i] >= (uint)vertexCount)
+                    return $"face {i / 3} references invalid vertex {via[i]}";
+            for (var t = 0; t < h; t += 3)
+                if (via[t] == via[t + 1] || via[t + 1] == via[t + 2] || via[t + 2] == via[t])
+                    return $"face {t / 3} repeats a vertex";
+
+            // one sort by UNDIRECTED key: each edge's two halfedges become an
+            // adjacent pair in the sorted order — twins with no second search
+            static long UKey(int a, int b) => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
+            var keys = new long[h];
+            var ids = new int[h];
+            for (var t = 0; t < h; t += 3)
+            {
+                keys[t] = UKey(via[t], via[t + 1]); ids[t] = t;
+                keys[t + 1] = UKey(via[t + 1], via[t + 2]); ids[t + 1] = t + 1;
+                keys[t + 2] = UKey(via[t + 2], via[t]); ids[t + 2] = t + 2;
+            }
+            Array.Sort(keys, ids);
+
+            var twin = new int[h];
+            for (var i = 0; i < h;)
+            {
+                var j = i + 1;
+                while (j < h && keys[j] == keys[i]) j++;
+                if (j - i != 2)
+                    return j - i == 1
+                        ? $"edge {(int)(keys[i] >> 32)}-{(int)keys[i]} has no opposite (open surface or inconsistent winding)"
+                        : $"edge {(int)(keys[i] >> 32)}-{(int)keys[i]} has {j - i} incident faces (non-manifold)";
+                var h0 = ids[i]; var h1 = ids[i + 1];
+                if (via[h0] == via[h1])
+                    return $"directed edge {via[h0]}->{via[h0 - h0 % 3 + (h0 + 1) % 3]} occurs twice (non-manifold or inconsistent winding)";
+                twin[h0] = h1;
+                twin[h1] = h0;
+                i = j;
+            }
+
+            // vertex links: walk the fan around each vertex through twins;
+            // it must visit every incident halfedge (rejects pinch vertices)
+            var degree = new int[vertexCount];
+            var outgoing = new int[vertexCount];
+            for (var i = 0; i < h; i++)
+            {
+                var v = via[i];
+                degree[v]++;
+                outgoing[v] = i;
+            }
+            for (var v = 0; v < vertexCount; v++)
+            {
+                if (degree[v] == 0) continue;
+                var start = outgoing[v];
+                var e = start;
+                var steps = 0;
+                do
+                {
+                    // previous halfedge in the face of e, then across
+                    var prev = e - e % 3 + (e + 2) % 3;
+                    e = twin[prev];
+                    if (++steps > degree[v]) break;
+                }
+                while (e != start);
+                if (steps != degree[v])
+                    return $"vertex {v} has a disconnected link ({degree[v]} incident faces, fan of {steps})";
+            }
+            return null;
         }
 
         /// <summary>

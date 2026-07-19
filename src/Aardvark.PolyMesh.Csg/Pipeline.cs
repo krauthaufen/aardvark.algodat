@@ -72,6 +72,8 @@ namespace Aardvark.Geometry
         private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
         private CsgBvh[] m_bvh = Array.Empty<CsgBvh>();
         private int[][] m_triOf = Array.Empty<int[]>();
+        private int[] m_adjNbr = Array.Empty<int>();
+        private int[] m_adjOffsets = Array.Empty<int>();
 
         /// <summary>optional pre-built solids providing cached BVHs (index-aligned with meshes; entries may be null)</summary>
         private readonly CsgMesh?[] m_prepared;
@@ -130,7 +132,7 @@ namespace Aardvark.Geometry
             // within the tolerance box around p (usually a single cell),
             // correctness comes from AreCoincident; hashed cell keys may alias,
             // which only adds candidates
-            var heads = new Dictionary<long, int>(n);
+            var heads = new Dictionary<long, int>(n, MixedLongComparer.Instance);
             var next = new int[n];
             for (var i = 0; i < n; i++)
             {
@@ -747,22 +749,43 @@ namespace Aardvark.Geometry
                 frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
             }
             Array.Sort(keys, frags);
-            var adjacency = new List<int>[Fragments.Count].SetByIndex(_ => new List<int>(3));
-            for (var i = 0; i < keys.Length;)
+            // CSR adjacency (two passes over the sorted runs, no per-fragment lists)
+            var nbrCount = new int[Fragments.Count];
+            for (var pass = 0; pass < 2; pass++)
             {
-                var j = i + 1;
-                while (j < keys.Length && keys[j] == keys[i]) j++;
-                for (var x = i; x < j; x++)
-                    for (var y = x + 1; y < j; y++)
-                    {
-                        var fx = frags[x]; var fy = frags[y];
-                        var mesh = m_kernel.TriMesh[Fragments[fx].Parent];
-                        if (m_kernel.TriMesh[Fragments[fy].Parent] != mesh) continue;
-                        if (m_barriers[mesh].Contains(keys[i])) continue;
-                        adjacency[fx].Add(fy);
-                        adjacency[fy].Add(fx);
-                    }
-                i = j;
+                int[]? nbr = null;
+                int[]? offsets = null;
+                if (pass == 1)
+                {
+                    offsets = new int[Fragments.Count + 1];
+                    for (var f = 0; f < Fragments.Count; f++) offsets[f + 1] = offsets[f] + nbrCount[f];
+                    nbr = new int[offsets[Fragments.Count]];
+                    Array.Clear(nbrCount, 0, nbrCount.Length);
+                }
+                for (var i = 0; i < keys.Length;)
+                {
+                    var j = i + 1;
+                    while (j < keys.Length && keys[j] == keys[i]) j++;
+                    for (var x = i; x < j; x++)
+                        for (var y = x + 1; y < j; y++)
+                        {
+                            var fx = frags[x]; var fy = frags[y];
+                            var mesh = m_kernel.TriMesh[Fragments[fx].Parent];
+                            if (m_kernel.TriMesh[Fragments[fy].Parent] != mesh) continue;
+                            if (m_barriers[mesh].Contains(keys[i])) continue;
+                            if (pass == 0)
+                            {
+                                nbrCount[fx]++; nbrCount[fy]++;
+                            }
+                            else
+                            {
+                                nbr![offsets![fx] + nbrCount[fx]++] = fy;
+                                nbr[offsets[fy] + nbrCount[fy]++] = fx;
+                            }
+                        }
+                    i = j;
+                }
+                if (pass == 1) { m_adjNbr = nbr!; m_adjOffsets = offsets!; }
             }
 
             var visited = new bool[Fragments.Count];
@@ -778,8 +801,9 @@ namespace Aardvark.Geometry
                 {
                     var f = stack.Pop();
                     region.Add(f);
-                    foreach (var g in adjacency[f])
+                    for (var e = m_adjOffsets[f]; e < m_adjOffsets[f + 1]; e++)
                     {
+                        var g = m_adjNbr[e];
                         if (visited[g]) continue;
                         visited[g] = true;
                         stack.Push(g);
