@@ -53,10 +53,20 @@ namespace Aardvark.Geometry
         {
             if (solids.Length < 2) throw new ArgumentException("need at least two solids");
             var o = options ?? CsgOptions.Default;
+            if (o.Verification != CsgVerification.None)
+            {
+                // input verification per solid, in parallel
+                var violations = new string?[solids.Length];
+                CsgParallel.For(0, solids.Length, o.MaxThreads, i =>
+                    violations[i] = ManifoldChecks.FindManifoldViolation(
+                        solids[i].FirstIndexArray, solids[i].VertexIndexArray, solids[i].PositionArray.Length));
+                for (var i = 0; i < solids.Length; i++)
+                    if (violations[i] != null)
+                        throw new CsgInputException($"input mesh {i} is not a closed manifold: {violations[i]}");
+            }
             var kernel = new Kernel(new Eps(o.RelativeEpsilon));
-            for (var i = 0; i < solids.Length; i++)
-                kernel.Ingest(solids[i], i, verify: o.Verification != CsgVerification.None);
-            var pipeline = new Pipeline(kernel);
+            for (var i = 0; i < solids.Length; i++) kernel.Ingest(solids[i], i, verify: false);
+            var pipeline = new Pipeline(kernel, maxThreads: o.MaxThreads);
             pipeline.Run();
             return new CsgArrangement(kernel, pipeline, solids, o);
         }
@@ -74,7 +84,7 @@ namespace Aardvark.Geometry
             var o = options ?? CsgOptions.Default;
             var kernel = new Kernel(new Eps(o.RelativeEpsilon));
             for (var i = 0; i < solids.Length; i++) kernel.IngestPrepared(solids[i], i);
-            var pipeline = new Pipeline(kernel, solids);
+            var pipeline = new Pipeline(kernel, solids, o.MaxThreads);
             pipeline.Run();
             return new CsgArrangement(kernel, pipeline, solids.Map(s => s.Source), o);
         }
@@ -212,7 +222,8 @@ namespace Aardvark.Geometry
                     default: throw new InvalidOperationException();
                 }
             }
-            var solids = Emitter.Emit(m_kernel, tris, m_sources, m_options.Verification == CsgVerification.Full);
+            var solids = Emitter.Emit(m_kernel, tris, m_sources,
+                m_options.Verification == CsgVerification.Full, m_options.MaxThreads);
             m_lastSolids = solids;
             return solids.Map(s => s.ToPolyMesh());
         }
@@ -234,7 +245,7 @@ namespace Aardvark.Geometry
     /// </summary>
     internal static class Emitter
     {
-        public static CsgMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify)
+        public static CsgMesh[] Emit(Kernel k, List<EmitTri> tris, PolyMesh[] sources, bool verify, int maxThreads = 1)
         {
             if (tris.Count == 0) return Array.Empty<CsgMesh>();
             var sw = Environment.GetEnvironmentVariable("CSG_PERF") != null

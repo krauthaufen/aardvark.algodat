@@ -32,6 +32,13 @@ namespace Aardvark.Geometry
         public double RelativeEpsilon { get; init; } = 1e-11;
         public CsgVerification Verification { get; init; } = CsgVerification.Full;
 
+        /// <summary>
+        /// Maximum number of threads used by an operation (default: all
+        /// cores). 1 runs fully sequentially. Results are deterministic and
+        /// identical for every setting.
+        /// </summary>
+        public int MaxThreads { get; init; } = Environment.ProcessorCount;
+
         public static readonly CsgOptions Default = new();
     }
 

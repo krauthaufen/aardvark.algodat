@@ -237,8 +237,11 @@ namespace Aardvark.Geometry.Tests
                 return Median(times);
             }
 
-            var inputOnly = new CsgOptions { Verification = CsgVerification.InputOnly };
-            Console.WriteLine($"{"case",-22} {"tris",8} {"polymesh",10} {"prepared",10} {"prep+io",10}");
+            var seq = new CsgOptions { MaxThreads = 1 };
+            var seqIo = new CsgOptions { MaxThreads = 1, Verification = CsgVerification.InputOnly };
+            var par = new CsgOptions();
+            var parIo = new CsgOptions { Verification = CsgVerification.InputOnly };
+            Console.WriteLine($"{"case",-14} {"tris",8} {"poly-1t",9} {"prep-1t",9} {"prep-1t-io",10} {"poly-mt",9} {"prep-mt",9} {"prep-mt-io",10}");
             foreach (var sub in new[] { 3, 4, 5, 6 })
             {
                 var pa = CsgM5Tests.Icosphere(V3d.Zero, 1.0, sub);
@@ -246,20 +249,13 @@ namespace Aardvark.Geometry.Tests
                 var a = CsgMesh.FromPolyMesh(pa);
                 var b = CsgMesh.FromPolyMesh(pb);
                 var tris = (pa.FirstIndexArray.Length - 1) * 2;
-                var mPoly = Measure(() => Csg.Union(pa, pb));
-                var mPrep = Measure(() => Csg.Union(a, b));
-                var mPrepIo = Measure(() => Csg.Union(a, b, inputOnly));
-                Console.WriteLine($"{"sphere-" + sub,-22} {tris,8} {mPoly,9:0.0}m {mPrep,9:0.0}m {mPrepIo,9:0.0}m");
-            }
-            {
-                var pa = CsgM6Tests.LPrism();
-                var pb = CsgM6Tests.LPrism().Transformed(Trafo3d.RotationZInDegrees(90) * Trafo3d.Translation(1.75, 0.25, 0.3));
-                var a = CsgMesh.FromPolyMesh(pa);
-                var b = CsgMesh.FromPolyMesh(pb);
-                var mPoly = Measure(() => Csg.Union(pa, pb));
-                var mPrep = Measure(() => Csg.Union(a, b));
-                var mPrepIo = Measure(() => Csg.Union(a, b, inputOnly));
-                Console.WriteLine($"{"lprism-lprism",-22} {40,8} {mPoly,9:0.0}m {mPrep,9:0.0}m {mPrepIo,9:0.0}m");
+                var m1 = Measure(() => Csg.Union(pa, pb, seq));
+                var m2 = Measure(() => Csg.Union(a, b, seq));
+                var m3 = Measure(() => Csg.Union(a, b, seqIo));
+                var m4 = Measure(() => Csg.Union(pa, pb, par));
+                var m5 = Measure(() => Csg.Union(a, b, par));
+                var m6 = Measure(() => Csg.Union(a, b, parIo));
+                Console.WriteLine($"{"sphere-" + sub,-14} {tris,8} {m1,8:0.0}m {m2,8:0.0}m {m3,9:0.0}m {m4,8:0.0}m {m5,8:0.0}m {m6,9:0.0}m");
             }
         }
 

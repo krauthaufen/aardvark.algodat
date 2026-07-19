@@ -78,8 +78,11 @@ namespace Aardvark.Geometry
         /// <summary>optional pre-built solids providing cached BVHs (index-aligned with meshes; entries may be null)</summary>
         private readonly CsgMesh?[] m_prepared;
 
-        public Pipeline(Kernel kernel, CsgMesh?[]? prepared = null)
+        private readonly int m_maxThreads;
+
+        public Pipeline(Kernel kernel, CsgMesh?[]? prepared = null, int maxThreads = 1)
         {
+            m_maxThreads = maxThreads.Max(1);
             kernel.UpdateSceneScale();
             m_kernel = kernel;
             m_eps = kernel.Eps;
@@ -510,15 +513,14 @@ namespace Aardvark.Geometry
                 }
             }
 
-            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            // per-face triangulations run in parallel (read-only kernel,
+            // private CDT state); assembly stays in face order → deterministic
+            var results = new (List<(int, int, int)> Tris, List<(int, int)> Constraints)?[m_kernel.TriangleCount];
+            CsgParallel.For(0, m_kernel.TriangleCount, m_maxThreads, tri =>
             {
                 var constraints = m_faceConstraints.GetOrDefault(tri);
                 var boundary = BoundaryPoints(tri);
-                if (constraints == null && boundary == null)
-                {
-                    Fragments.Add(new Fragment(m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri], tri));
-                    continue;
-                }
+                if (constraints == null && boundary == null) return;
 
                 m_diagTri = tri;
                 var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
@@ -545,29 +547,24 @@ namespace Aardvark.Geometry
                     foreach (var (ca, cb) in constraints) cdt.AddConstraint(ca, cb);
                 }
 
-                var debugFace = Environment.GetEnvironmentVariable("CSG_DEBUG_FACE") == tri.ToString();
-                if (debugFace)
-                {
-                    Console.WriteLine($"FACE {tri}: corners {m_kernel.T0[tri]},{m_kernel.T1[tri]},{m_kernel.T2[tri]}");
-                    if (boundary != null) Console.WriteLine($"  boundary: {string.Join(",", boundary)}");
-                    if (constraints != null)
-                        foreach (var (ca, cb) in constraints) Console.WriteLine($"  constraint ({ca},{cb})");
-                }
-                List<(int, int, int)> tris;
-                List<(int, int)> constraintEdges;
                 try
                 {
-                    (tris, constraintEdges) = cdt.Triangulate();
+                    results[tri] = cdt.Triangulate();
                 }
                 catch (CsgVerificationException e)
                 {
                     throw new CsgVerificationException(Diag(e));
                 }
-                if (debugFace)
+            });
+
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                if (results[tri] == null)
                 {
-                    foreach (var (x, y, z) in tris) Console.WriteLine($"  tri ({x},{y},{z})");
-                    foreach (var (x, y) in constraintEdges) Console.WriteLine($"  constrained ({x},{y})");
+                    Fragments.Add(new Fragment(m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri], tri));
+                    continue;
                 }
+                var (tris, constraintEdges) = results[tri]!.Value;
                 foreach (var (a, b, c) in tris) Fragments.Add(new Fragment(a, b, c, tri));
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
                 foreach (var (a, b) in constraintEdges) barrier.Add(EdgeKey(a, b));
@@ -577,13 +574,14 @@ namespace Aardvark.Geometry
         private string Diag(Exception e, params int[] vids)
         {
             var tri = m_diagTri;
-            var s = $"{e.Message} [tri {tri} mesh {m_kernel.TriMesh[tri]} face {m_kernel.TriFace[tri]} " +
+            var msg = $"{e.Message} [tri {tri} mesh {m_kernel.TriMesh[tri]} face {m_kernel.TriFace[tri]} " +
                 $"corners ({m_kernel.T0[tri]}:{m_kernel.Positions[m_kernel.T0[tri]]}, {m_kernel.T1[tri]}:{m_kernel.Positions[m_kernel.T1[tri]]}, {m_kernel.T2[tri]}:{m_kernel.Positions[m_kernel.T2[tri]]})";
-            foreach (var v in vids) s += $" point {v}:{m_kernel.Positions[v]} gen {m_kernel.Generation[v]}";
-            return s + "]";
+            foreach (var v in vids) msg += $" point {v}:{m_kernel.Positions[v]} gen {m_kernel.Generation[v]}";
+            return msg + "]";
         }
 
-        private int m_diagTri;
+        [ThreadStatic]
+        private static int m_diagTri;
 
         /// <summary>
         /// Resolves interactions between constraint segments before
@@ -805,10 +803,10 @@ namespace Aardvark.Geometry
             }
 
             var visited = new bool[Fragments.Count];
+            var regions = new List<List<int>>();
             for (var seedFrag = 0; seedFrag < Fragments.Count; seedFrag++)
             {
                 if (visited[seedFrag]) continue;
-                var mi = m_kernel.TriMesh[Fragments[seedFrag].Parent];
                 var region = new List<int>();
                 var stack = new Stack<int>();
                 stack.Push(seedFrag);
@@ -825,9 +823,15 @@ namespace Aardvark.Geometry
                         stack.Push(g);
                     }
                 }
+                regions.Add(region);
+            }
 
-                // per other mesh: coverage is uniform across the region — use a
-                // pre-set coplanar label if any fragment has one, else ray parity
+            // per (region × other mesh) classification is independent: reads
+            // the kernel and BVHs, writes disjoint label slots
+            CsgParallel.For(0, regions.Count, m_maxThreads, ri =>
+            {
+                var region = regions[ri];
+                var mi = m_kernel.TriMesh[Fragments[region[0]].Parent];
                 for (var m = 0; m < n; m++)
                 {
                     if (m == mi) continue;
@@ -843,7 +847,7 @@ namespace Aardvark.Geometry
                     foreach (var f in region)
                         if (m_rel[f * n + m] == 0) m_rel[f * n + m] = pre;
                 }
-            }
+            });
         }
 
         /// <summary>
