@@ -903,11 +903,36 @@ namespace Aardvark.Geometry
                         {
                             var j = (i + 1) % 3;
                             if (e == v[i] || e == v[j]) continue;
-                            var tjf = Fun.Max(m_kernel.TolFactor[e], Eps.GenerationFactor);
+                            // the edge's working resolution counts too: a cut
+                            // point hugging an edge whose endpoints carry wide
+                            // factors forms a sub-resolution lens unless it is
+                            // registered (and thus flattened) onto the edge
+                            var tjf = Fun.Max(m_kernel.TolFactor[e], Eps.GenerationFactor)
+                                .Max(m_kernel.TolFactor[v[i]]).Max(m_kernel.TolFactor[v[j]]);
+                            // 2D-only tests are blind along the projection
+                            // axis: the point must also lie on the face plane
+                            if (m_eps.HeightSign(plane, m_kernel.Positions[e], tjf) != Sign3.On) continue;
                             if (m_eps.AreaSign(p[i], p[j], q, tjf) != Sign3.On) continue;
                             var d = p[j] - p[i]; var w = q - p[i];
                             var dot = d.Dot(w);
-                            if (dot <= 0 || dot >= d.LengthSquared) continue;
+                            if (dot <= 0 || dot >= d.LengthSquared)
+                            {
+                                // in the edge band but beyond an endpoint: the
+                                // point claims that corner's location, so its
+                                // distance to it measures real scatter — widen
+                                // the factor so the late weld can unify them
+                                var corner = dot <= 0 ? v[i] : v[j];
+                                var cdist = (m_kernel.Positions[e] - m_kernel.Positions[corner]).NormMax;
+                                var needed = Eps.GenerationFactor * cdist
+                                    / (m_eps.Relative * (2 * m_kernel.Positions[e].NormMax + m_eps.Scene));
+                                // cap at MaxFactor: the weld's own coincidence
+                                // test decides whether the capped band reaches;
+                                // beyond GenerationFactor*MaxFactor the point
+                                // is genuinely distinct — no bump
+                                if (needed <= Eps.GenerationFactor * Eps.MaxFactor && needed > m_kernel.TolFactor[e])
+                                    BumpFactor(e, needed.Min(Eps.MaxFactor));
+                                continue;
+                            }
                             if (s_debugFace == tri.ToString())
                                 Console.WriteLine($"TJREG tri {tri}: {e} on edge ({v[i]},{v[j]})");
                             RegisterEdgePoint(v[i], v[j], e);
@@ -927,8 +952,20 @@ namespace Aardvark.Geometry
             // saw for a given face — re-check on the final ids (idempotent)
             InsertabilityPrepass();
             // the prepasses measured and widened factors again: points whose
-            // FINAL tolerances overlap must unify before faces consume them
-            LateWeld();
+            // FINAL tolerances overlap must unify before faces consume them.
+            // welding widens representative factors, which can make further
+            // pairs overlap — iterate to a fixpoint (bounded: factors are
+            // capped at MaxFactor, aliases only grow)
+            for (var round = 0; round < 4; round++)
+            {
+                var seen = m_lateAlias.Count;
+                LateWeld();
+                FaceFeasibilityWeld();
+                if (m_lateAlias.Count == seen) break;
+            }
+            // weld remaps can merge a welded point's registrations onto its
+            // representative, recreating multi-edge conflicts — dedupe again
+            DedupeEdgeAssignments();
 
             // per-face triangulations run in parallel (read-only kernel,
             // private CDT state); assembly stays in face order → deterministic
@@ -936,6 +973,7 @@ namespace Aardvark.Geometry
             Lap2("subdiv-prep");
             CsgParallel.For(0, m_kernel.TriangleCount, m_maxThreads, tri =>
             {
+                if (m_deadTri.Contains(tri)) return;
                 var constraints = m_faceConstraints.GetOrDefault(tri);
                 var boundary = BoundaryPoints(tri);
                 if (constraints == null && boundary == null) return;
@@ -987,19 +1025,18 @@ namespace Aardvark.Geometry
                         ordered.Add(((dir3.Dot(m_kernel.Positions[vid] - pu3) / len23).Clamp(0.0, 1.0), vid));
                     ordered.Sort();
                     var u2 = Proj(su); var v2 = Proj(sv);
-                    // all decisions below are made on the shared parameter t,
-                    // so both faces consuming this edge subdivide identically
-                    const double tSnap = 1e-12;
-                    var prev = su; var prevT = 0.0;
-                    foreach (var (t, vid) in ordered)
+                    // identity was decided globally; the chain only places
+                    // the surviving points, with t clamped off the exact
+                    // corners so no per-face corner aliasing can occur —
+                    // decisions on the shared t are identical in both faces
+                    var prev = su;
+                    foreach (var (t0, vid) in ordered)
                     {
                         if (cdt.KnowsKernel(vid)) continue;
-                        if (t <= tSnap) { cdt.AliasKernel(vid, su); continue; }
-                        if (t >= 1 - tSnap) { cdt.AliasKernel(vid, sv); continue; }
-                        if (t - prevT <= tSnap) { cdt.AliasKernel(vid, prev); continue; }
+                        var t = t0.Clamp(1e-9, 1 - 1e-9);
                         try { cdt.InsertOnEdge(prev, sv, vid, u2 + t * (v2 - u2)); }
                         catch (CsgVerificationException e) { throw new CsgVerificationException(Diag(e, vid)); }
-                        prev = vid; prevT = t;
+                        prev = vid;
                     }
                 }
                 if (constraints != null)
@@ -1025,13 +1062,15 @@ namespace Aardvark.Geometry
             Lap2("subdiv-cdt");
             var counts = new int[m_kernel.TriangleCount + 1];
             for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
-                counts[tri + 1] = counts[tri] + (results[tri] == null ? 1 : results[tri]!.Value.Tris.Count);
+                counts[tri + 1] = counts[tri] + (results[tri] != null ? results[tri]!.Value.Tris.Count
+                    : m_deadTri.Contains(tri) ? 0 : 1);
             var fragmentArray = new Fragment[counts[m_kernel.TriangleCount]];
             CsgParallel.For(0, m_kernel.TriangleCount, m_maxThreads, tri =>
             {
                 var at = counts[tri];
                 if (results[tri] == null)
                 {
+                    if (m_deadTri.Contains(tri)) return;
                     fragmentArray[at] = new Fragment(m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri], tri);
                     return;
                 }
@@ -1148,6 +1187,7 @@ namespace Aardvark.Geometry
                         var v2 = Triangulator.ProjectDominant(normal, m_kernel.Positions[v]);
                         var pf = Fun.Max(Fun.Max(m_kernel.TolFactor[a], m_kernel.TolFactor[b]),
                             m_kernel.TolFactor[v]).Max(Eps.GenerationFactor);
+                        if (m_eps.HeightSign(m_kernel.Planes[m_kernel.TriPlane[tri]], m_kernel.Positions[v], pf) != Sign3.On) continue;
                         if (m_eps.AreaSign(a2, b2, v2, pf) != Sign3.On) continue;
                         var t = d2.Dot(v2 - a2);
                         if (t <= 0 || t >= len2) continue;
@@ -1248,24 +1288,31 @@ namespace Aardvark.Geometry
                                 if (!m_eps.AreCoincident(p, m_kernel.Positions[j], pf)) continue;
                                 var lo = Math.Min(vid, j);
                                 var hi = Math.Max(vid, j);
-                                if (hi < inputCount || alias.ContainsKey(hi)) continue;
+                                if (alias.ContainsKey(hi)) continue;
                                 var target = Rep(lo);
                                 if (target == hi) continue;
                                 alias[hi] = target;
                                 m_kernel.TolFactor[target] = m_kernel.TolFactor[target].Max(m_kernel.TolFactor[hi]);
+                                if (hi < inputCount) m_inputWelded = true;
                             }
                         }
             }
             if (alias.Count == before) return;
+            ApplyLateAlias();
+            if (m_inputWelded) RemapKernelTopology();
+        }
 
+        /// <summary>Rewrites constraint segments and edge registries through the global alias map.</summary>
+        private void ApplyLateAlias()
+        {
             foreach (var (_, constraints) in m_faceConstraints)
             {
                 var segs = new List<(int, int)>(constraints);
                 constraints.Clear();
                 foreach (var (a, b) in segs)
                 {
-                    var ra = Rep(a);
-                    var rb = Rep(b);
+                    var ra = RepLate(a);
+                    var rb = RepLate(b);
                     if (ra != rb) constraints.Add(SortedEdge(ra, rb));
                 }
             }
@@ -1275,11 +1322,113 @@ namespace Aardvark.Geometry
                 var mapped = new List<int>();
                 foreach (var p in pts)
                 {
-                    var r = Rep(p);
+                    var r = RepLate(p);
                     if (r != u && r != w && !mapped.Contains(r)) mapped.Add(r);
                 }
                 pts.Clear();
                 foreach (var p in mapped) pts.Add(p);
+            }
+        }
+
+        /// <summary>
+        /// Identity decisions are global, faces only triangulate: two points a
+        /// face consumes that lie within the face's area-predicate feasibility
+        /// radius cannot be separated by any predicate there — merging them
+        /// per-face would let different faces disagree about identity (cracks),
+        /// so they are welded in kernel space for everyone. Input vertices are
+        /// never welded away.
+        /// </summary>
+        private void FaceFeasibilityWeld()
+        {
+            var inputCount = 0;
+            foreach (var c in m_kernel.VertexCount) inputCount += c;
+            var before = m_lateAlias.Count;
+            var pts = new List<int>();
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                var constraints = m_faceConstraints.GetOrDefault(tri);
+                var boundary = BoundaryPoints(tri);
+                if (constraints == null && boundary == null) continue;
+
+                pts.Clear();
+                pts.Add(m_kernel.T0[tri]); pts.Add(m_kernel.T1[tri]); pts.Add(m_kernel.T2[tri]);
+                if (boundary != null) foreach (var v in boundary) if (!pts.Contains(v)) pts.Add(v);
+                if (constraints != null)
+                    foreach (var (ca, cb) in constraints)
+                    {
+                        if (!pts.Contains(ca)) pts.Add(ca);
+                        if (!pts.Contains(cb)) pts.Add(cb);
+                    }
+
+                var p0 = m_kernel.Positions[m_kernel.T0[tri]];
+                var p1 = m_kernel.Positions[m_kernel.T1[tri]];
+                var p2 = m_kernel.Positions[m_kernel.T2[tri]];
+                var mag = Fun.Max(p0.NormMax, p1.NormMax, p2.NormMax);
+                var ext = Fun.Max((p1 - p0).NormMax, (p2 - p0).NormMax, (p2 - p1).NormMax);
+                var radius = 4 * m_eps.Relative * (mag + ext + m_eps.Scene) * FaceFactor(tri);
+                if (s_debugFace == tri.ToString())
+                {
+                    Console.WriteLine($"FFW {tri}: radius {radius:E2} factor {FaceFactor(tri):0.#} pts {string.Join(",", pts)}");
+                    for (var i = 0; i < pts.Count; i++)
+                        Console.WriteLine($"  ffw pt {pts[i]} {m_kernel.Positions[RepLate(pts[i])]} f{m_kernel.TolFactor[RepLate(pts[i])]:0.#}");
+                }
+
+                for (var i = 0; i < pts.Count; i++)
+                    for (var j = i + 1; j < pts.Count; j++)
+                    {
+                        var a = RepLate(pts[i]); var b = RepLate(pts[j]);
+                        if (a == b) continue;
+                        var lo = Math.Min(a, b); var hi = Math.Max(a, b);
+                        if (m_lateAlias.ContainsKey(hi)) continue;
+                        if ((m_kernel.Positions[lo] - m_kernel.Positions[hi]).NormMax > radius) continue;
+                        m_lateAlias[hi] = lo;
+                        m_kernel.TolFactor[lo] = m_kernel.TolFactor[lo].Max(m_kernel.TolFactor[hi]);
+                        if (hi < inputCount) m_inputWelded = true;
+                    }
+            }
+            if (m_lateAlias.Count != before) ApplyLateAlias();
+            if (m_inputWelded) RemapKernelTopology();
+        }
+
+        private bool m_inputWelded;
+        private readonly HashSet<int> m_deadTri = new();
+
+        /// <summary>
+        /// Input-vertex welds are edge collapses: rewrite triangle corners
+        /// through the alias map, retire triangles that lost a dimension, and
+        /// remap edge-registry keys. Collapsing an edge whose endpoints'
+        /// widened tolerances overlap moves geometry strictly within the
+        /// working resolution.
+        /// </summary>
+        private void RemapKernelTopology()
+        {
+            m_inputWelded = false;
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                var t0 = RepLate(m_kernel.T0[tri]);
+                var t1 = RepLate(m_kernel.T1[tri]);
+                var t2 = RepLate(m_kernel.T2[tri]);
+                m_kernel.T0[tri] = t0; m_kernel.T1[tri] = t1; m_kernel.T2[tri] = t2;
+                if (t0 == t1 || t1 == t2 || t2 == t0)
+                {
+                    m_deadTri.Add(tri);
+                    m_faceConstraints.Remove(tri);
+                }
+            }
+            var oldEdges = new List<((int, int) Edge, HashSet<int> Pts)>();
+            foreach (var (edge, pts) in m_edgePoints) oldEdges.Add((edge, pts));
+            m_edgePoints.Clear();
+            foreach (var (edge, pts) in oldEdges)
+            {
+                var u = RepLate(edge.Item1);
+                var w = RepLate(edge.Item2);
+                if (u == w) continue;
+                var target = m_edgePoints.GetOrCreate(SortedEdge(u, w), _ => new HashSet<int>());
+                foreach (var p in pts)
+                {
+                    var r = RepLate(p);
+                    if (r != u && r != w) target.Add(r);
+                }
             }
         }
 
@@ -1340,6 +1489,7 @@ namespace Aardvark.Geometry
                         var (a, b) = edges[i]; var (c, d) = edges[j];
                         if (a != c && a != d && b != c && b != d) continue;
                         var loser = Dist2(vid, edges[i]) <= Dist2(vid, edges[j]) ? edges[j] : edges[i];
+                        if (s_debugReg) Console.WriteLine($"DEDUPE {vid}: ({a},{b}) vs ({c},{d}) -> drop ({loser.Item1},{loser.Item2})");
                         m_edgePoints[loser].Remove(vid);
                     }
             }
@@ -1355,8 +1505,11 @@ namespace Aardvark.Geometry
                 var constraints = m_faceConstraints.GetOrDefault(tri);
                 if (constraints == null) continue;
                 var onEdge = BoundaryPoints(tri);
+                var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
                 bool Ok(int vid) => vid == m_kernel.T0[tri] || vid == m_kernel.T1[tri] || vid == m_kernel.T2[tri]
-                    || (onEdge != null && onEdge.Contains(vid)) || EnsureInsertable(tri, vid);
+                    || ((onEdge != null && onEdge.Contains(vid))
+                        || m_eps.HeightSign(plane, m_kernel.Positions[vid], m_kernel.TolFactor[vid].Max(Eps.GenerationFactor)) == Sign3.On)
+                       && EnsureInsertable(tri, vid);
                 constraints.RemoveWhere(seg => !Ok(seg.Item1) || !Ok(seg.Item2));
             }
         }

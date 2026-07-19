@@ -554,8 +554,18 @@ namespace Aardvark.Geometry
                         var lu = int.Parse(match.Groups[1].Value);
                         var lv = int.Parse(match.Groups[2].Value);
                         if (lu < kernelOfLocal.Count && lv < kernelOfLocal.Count)
+                        {
                             context = $" [kernel {kernelOfLocal[lu]}@{positions[lu]} f{k.TolFactor[kernelOfLocal[lu]]:0.#} - " +
                                       $"{kernelOfLocal[lv]}@{positions[lv]} f{k.TolFactor[kernelOfLocal[lv]]:0.#}]";
+                            for (var i = 0; i < triCount; i++)
+                            {
+                                var m0 = via[i * 3] == lu || via[i * 3 + 1] == lu || via[i * 3 + 2] == lu;
+                                var m1 = via[i * 3] == lv || via[i * 3 + 1] == lv || via[i * 3 + 2] == lv;
+                                if (m0 && m1)
+                                    context += $" [frag {i} parent-tri {tris[i].Parent} mesh {k.TriMesh[tris[i].Parent]} " +
+                                        $"face {k.TriFace[tris[i].Parent]} corners {kernelOfLocal[via[i * 3]]},{kernelOfLocal[via[i * 3 + 1]]},{kernelOfLocal[via[i * 3 + 2]]}]";
+                            }
+                        }
                     }
                     throw new CsgVerificationException($"output verification failed: {violation}{context}");
                 }

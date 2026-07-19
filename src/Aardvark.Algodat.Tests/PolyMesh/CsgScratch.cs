@@ -378,6 +378,17 @@ namespace Aardvark.Geometry.Tests
                 var pipe = new Pipeline(kernel, maxThreads: 1);
                 try { pipe.Run(); Console.WriteLine("pipeline ok"); }
                 catch (Exception ex) { Console.WriteLine($"pipeline FAIL: {ex.Message}"); }
+                foreach (var (opName, op) in new (string, Func<CsgArrangement, PolyMesh[]>)[]
+                    { ("union", r => r.Union()), ("inter", r => r.Intersection()), ("diff", r => r.Difference()) })
+                {
+                    try
+                    {
+                        var arr = CsgArrangement.Arrange(a, b, new CsgOptions { MaxThreads = 1 });
+                        op(arr);
+                        Console.WriteLine($"{opName} ok");
+                    }
+                    catch (Exception ex) { Console.WriteLine($"{opName} FAIL: {ex.Message}"); }
+                }
             }
         }
 

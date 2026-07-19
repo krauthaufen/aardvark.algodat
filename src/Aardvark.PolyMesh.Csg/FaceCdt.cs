@@ -64,7 +64,6 @@ namespace Aardvark.Geometry
             m_dead.Clear();
             m_constrained.Clear();
             m_constraints.Clear();
-            m_healGuard = 0;
             // point-alias radius from area-predicate feasibility: a segment of
             // length s only admits a strict Area sign against a point at
             // height h when s*h > eps*(m+h+Scene)*h*factor, i.e. when
@@ -102,78 +101,84 @@ namespace Aardvark.Geometry
 
         private static (int, int) Key(int a, int b) => a < b ? (a, b) : (b, a);
 
-        /// <summary>Inserts a point; returns its local id (an existing one if the point coincides with an existing vertex).</summary>
+        /// <summary>
+        /// Inserts a point with raw-double routing: raw orientation always
+        /// yields a valid subdivision, so no degeneracy healing is needed.
+        /// Identity was decided globally — only bit-exact 2D corner
+        /// duplicates alias (a pair coincident in this projection cannot be
+        /// separated by any predicate here). Points eps-inside but raw-outside
+        /// (guaranteed absorbable upstream) clamp onto the nearest boundary
+        /// sub-edge.
+        /// </summary>
         public int InsertPoint(int kernelId, V2d p)
         {
             if (m_localOfKernel.TryGetValue(kernelId, out var known)) return known;
 
-            // no two points below the face's working resolution may coexist:
-            // alias against every existing point first (scan-order corner
-            // detection alone can split an edge before seeing the coincident
-            // corner, leaving unrecoverable sub-resolution constraints)
-            for (var i = 0; i < m_pos.Count; i++)
-            {
-                if ((p - m_pos[i]).NormMax <= m_aliasTol)
-                {
-                    m_localOfKernel[kernelId] = i;
-                    return i;
-                }
-            }
+            static double Det(in V2d a, in V2d b, in V2d c)
+                => (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X);
 
             for (var t = 0; t < m_t0.Count; t++)
             {
                 if (m_dead[t]) continue;
                 var (a, b, c) = Tri(t);
-                var s0 = Area(m_pos[a], m_pos[b], p);
-                var s1 = Area(m_pos[b], m_pos[c], p);
-                var s2 = Area(m_pos[c], m_pos[a], p);
-                if (s0 == Sign3.Below || s1 == Sign3.Below || s2 == Sign3.Below) continue;
-
-                var onCount = (s0 == Sign3.On ? 1 : 0) + (s1 == Sign3.On ? 1 : 0) + (s2 == Sign3.On ? 1 : 0);
-                if (onCount >= 2)
+                var d0 = Det(m_pos[a], m_pos[b], p);
+                var d1 = Det(m_pos[b], m_pos[c], p);
+                var d2 = Det(m_pos[c], m_pos[a], p);
+                if (d0 < 0 || d1 < 0 || d2 < 0) continue;
+                var z0 = d0 == 0; var z1 = d1 == 0; var z2 = d2 == 0;
+                var zeros = (z0 ? 1 : 0) + (z1 ? 1 : 0) + (z2 ? 1 : 0);
+                if (zeros >= 2)
                 {
-                    // on two edge lines at once: either genuinely coincident
-                    // with their shared corner (alias), or a sliver corner —
-                    // then continue with the edge line the point is closer to
-                    var corner = s0 == Sign3.On && s1 == Sign3.On ? b
-                               : s1 == Sign3.On && s2 == Sign3.On ? c : a;
-                    if ((p - m_pos[corner]).NormMax <= m_aliasTol)
-                    {
-                        m_localOfKernel[kernelId] = corner;
-                        return corner;
-                    }
-                    var d0 = s0 == Sign3.On ? LineDist2(m_pos[a], m_pos[b], p) : double.MaxValue;
-                    var d1 = s1 == Sign3.On ? LineDist2(m_pos[b], m_pos[c], p) : double.MaxValue;
-                    var d2 = s2 == Sign3.On ? LineDist2(m_pos[c], m_pos[a], p) : double.MaxValue;
-                    s0 = d0 <= d1 && d0 <= d2 ? Sign3.On : Sign3.Above;
-                    s1 = d1 < d0 && d1 <= d2 ? Sign3.On : Sign3.Above;
-                    s2 = d2 < d0 && d2 < d1 ? Sign3.On : Sign3.Above;
+                    var corner = z0 && z1 ? b : z1 && z2 ? c : a;
+                    m_localOfKernel[kernelId] = corner;
+                    return corner;
                 }
-
                 var li = AddPointRaw(kernelId, p);
-                if (s0 != Sign3.On && s1 != Sign3.On && s2 != Sign3.On)
+                if (zeros == 1)
                 {
-                    // interior: 1 -> 3
-                    m_dead[t] = true;
-                    AddTriChecked(a, b, li); AddTriChecked(b, c, li); AddTriChecked(c, a, li);
+                    var (u, v) = z0 ? (a, b) : z1 ? (b, c) : (c, a);
+                    SplitEdgeRaw(u, v, li);
                 }
                 else
                 {
-                    // on one edge: split it in this triangle and in the neighbor (if any)
-                    var (u, v) = s0 == Sign3.On ? (a, b) : s1 == Sign3.On ? (b, c) : (c, a);
-                    SplitEdgeAt(u, v, li);
+                    m_dead[t] = true;
+                    AddTri(a, b, li); AddTri(b, c, li); AddTri(c, a, li);
                 }
                 LegalizeAround(li);
                 return li;
             }
-            throw new CsgVerificationException("point to insert lies outside the face");
-        }
 
-        private static double LineDist2(in V2d a, in V2d b, in V2d p)
-        {
-            var d = b - a;
-            var det = d.X * (p.Y - a.Y) - d.Y * (p.X - a.X);
-            return det * det / d.LengthSquared.Max(1e-300);
+            // raw-outside every triangle (upstream guaranteed eps-inside):
+            // pull the point just inside the nearest boundary triangle —
+            // splitting the boundary edge itself would create a subdivision
+            // the neighbor face cannot see (a T-junction by construction)
+            var bTri = -1; var bProj = V2d.Zero; var bd = double.MaxValue;
+            for (var t = 0; t < m_t0.Count; t++)
+            {
+                if (m_dead[t]) continue;
+                var (a, b, c) = Tri(t);
+                Span<int> e = stackalloc int[] { a, b, b, c, c, a };
+                for (var i = 0; i < 3; i++)
+                {
+                    var u = e[i * 2]; var v = e[i * 2 + 1];
+                    if (FindTriWithEdge(v, u) >= 0) continue;
+                    var pu = m_pos[u]; var pv = m_pos[v];
+                    var dv = pv - pu;
+                    var tt = (dv.Dot(p - pu) / dv.LengthSquared.Max(1e-300)).Clamp(1e-9, 1 - 1e-9);
+                    var proj = pu + tt * dv;
+                    var dist = (p - proj).LengthSquared;
+                    if (dist < bd) { bd = dist; bTri = t; bProj = proj; }
+                }
+            }
+            if (bTri < 0) throw new CsgVerificationException("point to insert lies outside the face");
+            var (ba, bb, bc) = Tri(bTri);
+            var centroid = (m_pos[ba] + m_pos[bb] + m_pos[bc]) / 3.0;
+            var inside = bProj + 1e-9 * (centroid - bProj);
+            var lo = AddPointRaw(kernelId, inside);
+            m_dead[bTri] = true;
+            AddTri(ba, bb, lo); AddTri(bb, bc, lo); AddTri(bc, ba, lo);
+            LegalizeAround(lo);
+            return lo;
         }
 
         /// <summary>
@@ -235,57 +240,6 @@ namespace Aardvark.Geometry
             }
         }
 
-        /// <summary>Splits edge (u,v) at point li in both incident triangles, maintaining the constrained-edge set.</summary>
-        private void SplitEdgeAt(int u, int v, int li)
-        {
-            var t = FindTriWithEdge(u, v);
-            if (t >= 0)
-            {
-                var w = ThirdVertex(t, u, v);
-                m_dead[t] = true;
-                AddTriChecked(u, li, w); AddTriChecked(li, v, w);
-            }
-            var nt = FindTriWithEdge(v, u);
-            if (nt >= 0)
-            {
-                var x = ThirdVertex(nt, v, u);
-                m_dead[nt] = true;
-                AddTriChecked(v, li, x); AddTriChecked(li, u, x);
-            }
-            if (m_constrained.Contains(Key(u, v)))
-            {
-                m_constrained.Remove(Key(u, v));
-                m_constrained.Add(Key(u, li));
-                m_constrained.Add(Key(li, v));
-            }
-        }
-
-        /// <summary>
-        /// Adds a triangle unless it is degenerate (collinear within eps): a
-        /// sliver split can produce a zero-area flap whose middle vertex lies
-        /// on another edge line; the flap is dropped and the split propagated
-        /// across its long edge instead, which restores a valid subdivision.
-        /// </summary>
-        private void AddTriChecked(int a, int b, int c)
-        {
-            // Below is healed too: a corner-region point routed onto the
-            // wrong edge produces a raw-inverted flap, which would silently
-            // corrupt the topology and leave constraints unrecoverable
-            if (Area(m_pos[a], m_pos[b], m_pos[c]) == Sign3.Above)
-            {
-                AddTri(a, b, c);
-                return;
-            }
-            if (m_healGuard++ > 1000)
-                throw new CsgVerificationException("degenerate-triangle healing did not converge");
-            var ab = (m_pos[a] - m_pos[b]).LengthSquared;
-            var bc = (m_pos[b] - m_pos[c]).LengthSquared;
-            var ca = (m_pos[c] - m_pos[a]).LengthSquared;
-            var (p, q, mid) = ab >= bc && ab >= ca ? (a, b, c) : bc >= ca ? (b, c, a) : (c, a, b);
-            SplitEdgeAt(p, q, mid);
-        }
-
-        private int m_healGuard;
 
         private int FindTriWithEdge(int u, int v)
         {
@@ -450,7 +404,8 @@ namespace Aardvark.Geometry
                             if (!m_dead[t2]) soup += $" ({m_t0[t2]},{m_t1[t2]},{m_t2[t2]})";
                     throw new CsgVerificationException(
                         "constraint segment could not be recovered in face triangulation " +
-                        $"(local {a}@{m_pos[a]} -> {b}@{m_pos[b]}, {m_pos.Count} points, factor {m_factor:0.#}, tris{soup})");
+                        $"(kernel {m_kernelIds[a]} local {a}@{m_pos[a]} -> kernel {m_kernelIds[b]} local {b}@{m_pos[b]}, " +
+                        $"{m_pos.Count} points, factor {m_factor:0.#}, tris{soup})");
                 }
             }
             throw new CsgVerificationException("constraint enforcement did not converge");
