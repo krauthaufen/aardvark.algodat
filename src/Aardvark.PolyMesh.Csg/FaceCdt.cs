@@ -35,6 +35,33 @@ namespace Aardvark.Geometry
         public FaceCdt(Eps eps, int k0, V2d p0, int k1, V2d p1, int k2, V2d p2)
         {
             m_eps = eps;
+            Reset(k0, p0, k1, p1, k2, p2);
+        }
+
+        private FaceCdt(Eps eps) => m_eps = eps;
+
+        [ThreadStatic]
+        private static FaceCdt? s_pooled;
+
+        /// <summary>Thread-local pooled instance (avoids ~10 collection allocations per cut face).</summary>
+        public static FaceCdt Rent(Eps eps, int k0, V2d p0, int k1, V2d p1, int k2, V2d p2)
+        {
+            var cdt = s_pooled;
+            if (cdt == null || !cdt.m_eps.Equals(eps)) s_pooled = cdt = new FaceCdt(eps);
+            cdt.Reset(k0, p0, k1, p1, k2, p2);
+            return cdt;
+        }
+
+        private void Reset(int k0, V2d p0, int k1, V2d p1, int k2, V2d p2)
+        {
+            m_kernelIds.Clear();
+            m_pos.Clear();
+            m_localOfKernel.Clear();
+            m_t0.Clear(); m_t1.Clear(); m_t2.Clear();
+            m_dead.Clear();
+            m_constrained.Clear();
+            m_constraints.Clear();
+            m_healGuard = 0;
             AddPointRaw(k0, p0); AddPointRaw(k1, p1); AddPointRaw(k2, p2);
             if (Area(p0, p1, p2) != Sign3.Above)
                 throw new CsgVerificationException("face is not counter-clockwise in its plane projection");

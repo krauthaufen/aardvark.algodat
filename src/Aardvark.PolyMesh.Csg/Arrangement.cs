@@ -342,7 +342,14 @@ namespace Aardvark.Geometry
                 keys[i * 3 + 2] = Pipeline.EdgeKey(t.V2, t.V0);
                 hs[i * 3] = i * 3; hs[i * 3 + 1] = i * 3 + 1; hs[i * 3 + 2] = i * 3 + 2;
             });
-            RadixSorter.SortEdgeKeys(keys, hs, keys.Length, maxThreads);
+            if (Environment.GetEnvironmentVariable("CSG_PERF") != null)
+            {
+                var sw2 = System.Diagnostics.Stopwatch.StartNew();
+                RadixSorter.SortEdgeKeys(keys, hs, keys.Length, maxThreads);
+                Console.WriteLine($"PERF     pairing-radix: {sw2.Elapsed.TotalMilliseconds:0.0} ms");
+            }
+            else
+                RadixSorter.SortEdgeKeys(keys, hs, keys.Length, maxThreads);
 
             void Pair((int Tri, int Slot) a, (int Tri, int Slot) b)
             {
@@ -350,19 +357,23 @@ namespace Aardvark.Geometry
                 pair[b.Tri * 3 + b.Slot] = a;
             }
 
+            var blockStarts = Pipeline.RunAlignedBlocks(keys, maxThreads);
+            CsgParallel.For(0, blockStarts.Length - 1, maxThreads, blk =>
+            {
             var list = new List<(int Tri, int Slot)>(8);
-            for (var gi = 0; gi < keys.Length;)
+            var blockEnd = blockStarts[blk + 1];
+            for (var gi = blockStarts[blk]; gi < blockEnd;)
             {
                 // fast path: the overwhelmingly common 2-halfedge run
-                if (gi + 1 < keys.Length && keys[gi + 1] == keys[gi]
-                    && (gi + 2 >= keys.Length || keys[gi + 2] != keys[gi]))
+                if (gi + 1 < blockEnd && keys[gi + 1] == keys[gi]
+                    && (gi + 2 >= blockEnd || keys[gi + 2] != keys[gi]))
                 {
                     Pair((hs[gi] / 3, hs[gi] % 3), (hs[gi + 1] / 3, hs[gi + 1] % 3));
                     gi += 2;
                     continue;
                 }
                 var gj = gi + 1;
-                while (gj < keys.Length && keys[gj] == keys[gi]) gj++;
+                while (gj < blockEnd && keys[gj] == keys[gi]) gj++;
                 list.Clear();
                 for (var x = gi; x < gj; x++) list.Add((hs[x] / 3, hs[x] % 3));
                 var groupKey = keys[gi];
@@ -402,6 +413,7 @@ namespace Aardvark.Geometry
                     }
                 }
             }
+            });
             return pair;
         }
 

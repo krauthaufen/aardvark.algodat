@@ -90,15 +90,26 @@ namespace Aardvark.Geometry
                 .SetByIndex(_ => new HashSet<long>(MixedLongComparer.Instance));
         }
 
+        private static readonly string? s_debugFace = Environment.GetEnvironmentVariable("CSG_DEBUG_FACE");
+        private System.Diagnostics.Stopwatch? m_perfSw;
+        internal void Lap2(string stage)
+        {
+            if (m_perfSw == null) return;
+            Console.WriteLine($"PERF     {stage}: {m_perfSw.Elapsed.TotalMilliseconds:0.0} ms");
+            m_perfSw.Restart();
+        }
+
         public void Run()
         {
             var perf = Environment.GetEnvironmentVariable("CSG_PERF") != null;
             var sw = perf ? System.Diagnostics.Stopwatch.StartNew() : null;
+            m_perfSw = perf ? System.Diagnostics.Stopwatch.StartNew() : null;
             void Lap(string stage)
             {
                 if (sw == null) return;
                 Console.WriteLine($"PERF {stage}: {sw.Elapsed.TotalMilliseconds:0.0} ms");
                 sw.Restart();
+                m_perfSw!.Restart();
             }
             WeldVertices();
             Lap("weld");
@@ -203,6 +214,7 @@ namespace Aardvark.Geometry
                 if (bag != null)
                     foreach (var (i, j) in bag) Union(i, j);
 
+            Lap2("weld-probe");
             Canon = new int[n].SetByIndex(i => Find(i));
 
             // reject same-mesh welds (features below tolerance) for user
@@ -232,7 +244,24 @@ namespace Aardvark.Geometry
             // generation-1 coincidence tolerance still fits one neighbor cell
             m_gridH = (24 * m_eps.Relative * maxMag).Max(1e-300);
             for (var i = 0; i < n; i++)
-                if (Canon[i] == i) GridAdd(i);
+                if (Canon[i] == i && foreign[m_kernel.VertexMesh[i]].Contains(m_kernel.Positions[i]))
+                    GridAdd(i);
+            Lap2("weld-canon+grid");
+        }
+
+        /// <summary>Block boundaries into a sorted key array, aligned so no run crosses a block.</summary>
+        internal static int[] RunAlignedBlocks(long[] keys, int maxThreads)
+        {
+            var blocks = Math.Max(1, Math.Min(maxThreads, keys.Length / (1 << 14)));
+            var starts = new List<int>(blocks + 1) { 0 };
+            for (var b = 1; b < blocks; b++)
+            {
+                var at = (int)((long)keys.Length * b / blocks);
+                while (at < keys.Length && at > starts[^1] && keys[at] == keys[at - 1]) at++;
+                if (at > starts[^1] && at < keys.Length) starts.Add(at);
+            }
+            starts.Add(keys.Length);
+            return starts.ToArray();
         }
 
         private void GridAdd(int vid)
@@ -565,6 +594,7 @@ namespace Aardvark.Geometry
             // per-face triangulations run in parallel (read-only kernel,
             // private CDT state); assembly stays in face order → deterministic
             var results = new (List<(int, int, int)> Tris, List<(int, int)> Constraints)?[m_kernel.TriangleCount];
+            Lap2("subdiv-prep");
             CsgParallel.For(0, m_kernel.TriangleCount, m_maxThreads, tri =>
             {
                 var constraints = m_faceConstraints.GetOrDefault(tri);
@@ -575,7 +605,7 @@ namespace Aardvark.Geometry
                 var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
                 V2d Proj(int vid) => Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[vid]);
 
-                var cdt = new FaceCdt(m_eps,
+                var cdt = FaceCdt.Rent(m_eps,
                     m_kernel.T0[tri], Proj(m_kernel.T0[tri]),
                     m_kernel.T1[tri], Proj(m_kernel.T1[tri]),
                     m_kernel.T2[tri], Proj(m_kernel.T2[tri]));
@@ -606,17 +636,29 @@ namespace Aardvark.Geometry
                 }
             });
 
+            Lap2("subdiv-cdt");
+            var counts = new int[m_kernel.TriangleCount + 1];
             for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+                counts[tri + 1] = counts[tri] + (results[tri] == null ? 1 : results[tri]!.Value.Tris.Count);
+            var fragmentArray = new Fragment[counts[m_kernel.TriangleCount]];
+            CsgParallel.For(0, m_kernel.TriangleCount, m_maxThreads, tri =>
             {
+                var at = counts[tri];
                 if (results[tri] == null)
                 {
-                    Fragments.Add(new Fragment(m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri], tri));
-                    continue;
+                    fragmentArray[at] = new Fragment(m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri], tri);
+                    return;
                 }
-                var (tris, constraintEdges) = results[tri]!.Value;
-                foreach (var (a, b, c) in tris) Fragments.Add(new Fragment(a, b, c, tri));
+                foreach (var (a, b, c) in results[tri]!.Value.Tris)
+                    fragmentArray[at++] = new Fragment(a, b, c, tri);
+            });
+            Fragments.Clear();
+            Fragments.AddRange(fragmentArray);
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                if (results[tri] == null) continue;
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
-                foreach (var (a, b) in constraintEdges) barrier.Add(EdgeKey(a, b));
+                foreach (var (a, b) in results[tri]!.Value.Constraints) barrier.Add(EdgeKey(a, b));
             }
         }
 
@@ -812,9 +854,14 @@ namespace Aardvark.Geometry
                 keys[f * 3 + 2] = EdgeKey(frag.V2, frag.V0);
                 frags[f * 3] = f; frags[f * 3 + 1] = f; frags[f * 3 + 2] = f;
             });
+            Lap2("classify-keys");
             RadixSorter.SortEdgeKeys(keys, frags, keys.Length, m_maxThreads);
-            // CSR adjacency (two passes over the sorted runs, no per-fragment lists)
+            Lap2("classify-radix");
+            // CSR adjacency: run-aligned parallel blocks; counts and fill use
+            // atomic cursors (neighbor ORDER within a fragment is irrelevant —
+            // region sets and label values are order-independent)
             var nbrCount = new int[Fragments.Count];
+            var blockStarts = RunAlignedBlocks(keys, m_maxThreads);
             for (var pass = 0; pass < 2; pass++)
             {
                 int[]? nbr = null;
@@ -826,32 +873,40 @@ namespace Aardvark.Geometry
                     nbr = new int[offsets[Fragments.Count]];
                     Array.Clear(nbrCount, 0, nbrCount.Length);
                 }
-                for (var i = 0; i < keys.Length;)
+                var p = pass;
+                CsgParallel.For(0, blockStarts.Length - 1, m_maxThreads, blk =>
                 {
-                    var j = i + 1;
-                    while (j < keys.Length && keys[j] == keys[i]) j++;
-                    for (var x = i; x < j; x++)
-                        for (var y = x + 1; y < j; y++)
-                        {
-                            var fx = frags[x]; var fy = frags[y];
-                            var mesh = m_kernel.TriMesh[Fragments[fx].Parent];
-                            if (m_kernel.TriMesh[Fragments[fy].Parent] != mesh) continue;
-                            if (m_barriers[mesh].Contains(keys[i])) continue;
-                            if (pass == 0)
+                    var lo = blockStarts[blk];
+                    var hi = blockStarts[blk + 1];
+                    for (var i = lo; i < hi;)
+                    {
+                        var j = i + 1;
+                        while (j < hi && keys[j] == keys[i]) j++;
+                        for (var x = i; x < j; x++)
+                            for (var y = x + 1; y < j; y++)
                             {
-                                nbrCount[fx]++; nbrCount[fy]++;
+                                var fx = frags[x]; var fy = frags[y];
+                                var mesh = m_kernel.TriMesh[Fragments[fx].Parent];
+                                if (m_kernel.TriMesh[Fragments[fy].Parent] != mesh) continue;
+                                if (m_barriers[mesh].Contains(keys[i])) continue;
+                                if (p == 0)
+                                {
+                                    System.Threading.Interlocked.Increment(ref nbrCount[fx]);
+                                    System.Threading.Interlocked.Increment(ref nbrCount[fy]);
+                                }
+                                else
+                                {
+                                    nbr![offsets![fx] + System.Threading.Interlocked.Increment(ref nbrCount[fx]) - 1] = fy;
+                                    nbr[offsets[fy] + System.Threading.Interlocked.Increment(ref nbrCount[fy]) - 1] = fx;
+                                }
                             }
-                            else
-                            {
-                                nbr![offsets![fx] + nbrCount[fx]++] = fy;
-                                nbr[offsets[fy] + nbrCount[fy]++] = fx;
-                            }
-                        }
-                    i = j;
-                }
+                        i = j;
+                    }
+                });
                 if (pass == 1) { m_adjNbr = nbr!; m_adjOffsets = offsets!; }
             }
 
+            Lap2("classify-csr");
             var visited = new bool[Fragments.Count];
             var regions = new List<List<int>>();
             for (var seedFrag = 0; seedFrag < Fragments.Count; seedFrag++)
@@ -876,6 +931,7 @@ namespace Aardvark.Geometry
                 regions.Add(region);
             }
 
+            Lap2("classify-flood");
             // per (region × other mesh) classification is independent: reads
             // the kernel and BVHs, writes disjoint label slots
             CsgParallel.For(0, regions.Count, m_maxThreads, ri =>
