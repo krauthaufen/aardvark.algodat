@@ -22,6 +22,7 @@ namespace Aardvark.Geometry
     {
         private readonly Eps m_eps;
         private double m_factor = Eps.GenerationFactor;
+        private double m_aliasTol;
         private readonly List<int> m_kernelIds = new();
         private readonly List<V2d> m_pos = new();
         private readonly Dictionary<int, int> m_localOfKernel = new();
@@ -64,6 +65,14 @@ namespace Aardvark.Geometry
             m_constrained.Clear();
             m_constraints.Clear();
             m_healGuard = 0;
+            // point-alias radius from area-predicate feasibility: a segment of
+            // length s only admits a strict Area sign against a point at
+            // height h when s*h > eps*(m+h+Scene)*h*factor, i.e. when
+            // s > eps*(m+L+Scene)*factor — two points closer than that cannot
+            // be separated by any predicate in this face and must unify
+            var mag = Fun.Max(p0.NormMax, p1.NormMax, p2.NormMax);
+            var ext = Fun.Max((p1 - p0).NormMax, (p2 - p0).NormMax, (p2 - p1).NormMax);
+            m_aliasTol = 4 * m_eps.Relative * (mag + ext + m_eps.Scene) * m_factor;
             AddPointRaw(k0, p0); AddPointRaw(k1, p1); AddPointRaw(k2, p2);
             if (Area(p0, p1, p2) != Sign3.Above)
                 throw new CsgVerificationException("face is not counter-clockwise in its plane projection");
@@ -98,6 +107,19 @@ namespace Aardvark.Geometry
         {
             if (m_localOfKernel.TryGetValue(kernelId, out var known)) return known;
 
+            // no two points below the face's working resolution may coexist:
+            // alias against every existing point first (scan-order corner
+            // detection alone can split an edge before seeing the coincident
+            // corner, leaving unrecoverable sub-resolution constraints)
+            for (var i = 0; i < m_pos.Count; i++)
+            {
+                if ((p - m_pos[i]).NormMax <= m_aliasTol)
+                {
+                    m_localOfKernel[kernelId] = i;
+                    return i;
+                }
+            }
+
             for (var t = 0; t < m_t0.Count; t++)
             {
                 if (m_dead[t]) continue;
@@ -115,7 +137,7 @@ namespace Aardvark.Geometry
                     // then continue with the edge line the point is closer to
                     var corner = s0 == Sign3.On && s1 == Sign3.On ? b
                                : s1 == Sign3.On && s2 == Sign3.On ? c : a;
-                    if (m_eps.AreCoincident(p, m_pos[corner], m_factor))
+                    if ((p - m_pos[corner]).NormMax <= m_aliasTol)
                     {
                         m_localOfKernel[kernelId] = corner;
                         return corner;
@@ -154,6 +176,65 @@ namespace Aardvark.Geometry
             return det * det / d.LengthSquared.Max(1e-300);
         }
 
+        /// <summary>
+        /// Deterministic boundary subdivision: splits the current chain
+        /// sub-edge (prev→end) of a face edge at a registered edge point.
+        /// The 2D position is expected to lie exactly on the segment (lerped
+        /// by the caller), so the split is raw-valid by construction — no
+        /// band-based routing, no healing. Points at the exact position of
+        /// the chain predecessor or the end corner alias to it (identical
+        /// decision in every face sharing the edge).
+        /// </summary>
+        /// <summary>True when the kernel id already has a local vertex.</summary>
+        public bool KnowsKernel(int kernelId) => m_localOfKernel.ContainsKey(kernelId);
+
+        /// <summary>Maps kernelId to the local vertex of kernelTarget.</summary>
+        public void AliasKernel(int kernelId, int kernelTarget)
+        {
+            if (!m_localOfKernel.ContainsKey(kernelId))
+                m_localOfKernel[kernelId] = m_localOfKernel[kernelTarget];
+        }
+
+        public int InsertOnEdge(int prevKernel, int endKernel, int kernelId, V2d p)
+        {
+            if (m_localOfKernel.TryGetValue(kernelId, out var known)) return known;
+            var a = m_localOfKernel[prevKernel];
+            var b = m_localOfKernel[endKernel];
+            if (p == m_pos[a]) { m_localOfKernel[kernelId] = a; return a; }
+            if (p == m_pos[b]) { m_localOfKernel[kernelId] = b; return b; }
+            if (FindTriWithEdge(a, b) < 0 && FindTriWithEdge(b, a) < 0)
+                throw new CsgVerificationException("boundary chain edge missing during edge subdivision");
+            var li = AddPointRaw(kernelId, p);
+            SplitEdgeRaw(a, b, li);
+            LegalizeAround(li);
+            return li;
+        }
+
+        /// <summary>Splits edge (u,v) at li without degeneracy healing (caller guarantees validity).</summary>
+        private void SplitEdgeRaw(int u, int v, int li)
+        {
+            var t = FindTriWithEdge(u, v);
+            if (t >= 0)
+            {
+                var w = ThirdVertex(t, u, v);
+                m_dead[t] = true;
+                AddTri(u, li, w); AddTri(li, v, w);
+            }
+            var nt = FindTriWithEdge(v, u);
+            if (nt >= 0)
+            {
+                var x = ThirdVertex(nt, v, u);
+                m_dead[nt] = true;
+                AddTri(v, li, x); AddTri(li, u, x);
+            }
+            if (m_constrained.Contains(Key(u, v)))
+            {
+                m_constrained.Remove(Key(u, v));
+                m_constrained.Add(Key(u, li));
+                m_constrained.Add(Key(li, v));
+            }
+        }
+
         /// <summary>Splits edge (u,v) at point li in both incident triangles, maintaining the constrained-edge set.</summary>
         private void SplitEdgeAt(int u, int v, int li)
         {
@@ -187,7 +268,10 @@ namespace Aardvark.Geometry
         /// </summary>
         private void AddTriChecked(int a, int b, int c)
         {
-            if (Area(m_pos[a], m_pos[b], m_pos[c]) != Sign3.On)
+            // Below is healed too: a corner-region point routed onto the
+            // wrong edge produces a raw-inverted flap, which would silently
+            // corrupt the topology and leave constraints unrecoverable
+            if (Area(m_pos[a], m_pos[b], m_pos[c]) == Sign3.Above)
             {
                 AddTri(a, b, c);
                 return;
@@ -351,10 +435,60 @@ namespace Aardvark.Geometry
                         flipped = true;
                     }
                 }
+                // sub-band fallback: when every crossing test is On (micro
+                // segments near the working resolution, or edges legalized
+                // away), any triangulation inside the band is semantically
+                // valid — recover the edge with raw-double signs, which is
+                // pure topology repair and cannot contradict a committed
+                // ternary decision
+                if (!flipped) flipped = TryRawFlip(a, b, pa, pb);
                 if (!flipped)
-                    throw new CsgVerificationException("constraint segment could not be recovered in face triangulation");
+                {
+                    var soup = "";
+                    if (m_t0.Count < 40)
+                        for (var t2 = 0; t2 < m_t0.Count; t2++)
+                            if (!m_dead[t2]) soup += $" ({m_t0[t2]},{m_t1[t2]},{m_t2[t2]})";
+                    throw new CsgVerificationException(
+                        "constraint segment could not be recovered in face triangulation " +
+                        $"(local {a}@{m_pos[a]} -> {b}@{m_pos[b]}, {m_pos.Count} points, factor {m_factor:0.#}, tris{soup})");
+                }
             }
             throw new CsgVerificationException("constraint enforcement did not converge");
+        }
+
+        private bool TryRawFlip(int a, int b, in V2d pa, in V2d pb)
+        {
+            static double Det(in V2d p, in V2d q, in V2d r)
+                => (q.X - p.X) * (r.Y - p.Y) - (q.Y - p.Y) * (r.X - p.X);
+            for (var t = 0; t < m_t0.Count; t++)
+            {
+                if (m_dead[t]) continue;
+                var (t0, t1, t2) = Tri(t);
+                Span<int> e = stackalloc int[] { t0, t1, t1, t2, t2, t0 };
+                for (var i = 0; i < 3; i++)
+                {
+                    var u = e[i * 2]; var v = e[i * 2 + 1];
+                    if (u == a || u == b || v == a || v == b) continue;
+                    if (m_constrained.Contains(Key(u, v))) continue;
+                    var su = Det(pa, pb, m_pos[u]);
+                    var sv = Det(pa, pb, m_pos[v]);
+                    if (su == 0 || sv == 0 || (su > 0) == (sv > 0)) continue;
+                    var sa2 = Det(m_pos[u], m_pos[v], pa);
+                    var sb2 = Det(m_pos[u], m_pos[v], pb);
+                    if (sa2 == 0 || sb2 == 0 || (sa2 > 0) == (sb2 > 0)) continue;
+                    var ft = FindTriWithEdge(u, v);
+                    var nt = FindTriWithEdge(v, u);
+                    if (ft < 0 || nt < 0) continue;
+                    var w = ThirdVertex(ft, u, v);
+                    var x = ThirdVertex(nt, u, v);
+                    if (Det(m_pos[u], m_pos[x], m_pos[w]) <= 0) continue;
+                    if (Det(m_pos[x], m_pos[v], m_pos[w]) <= 0) continue;
+                    m_dead[ft] = true; m_dead[nt] = true;
+                    AddTri(u, x, w); AddTri(x, v, w);
+                    return true;
+                }
+            }
+            return false;
         }
 
         /// <summary>

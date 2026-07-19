@@ -301,7 +301,7 @@ namespace Aardvark.Geometry
                     {
                         if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
                         for (; j >= 0; j = next[j])
-                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], factor)) return j;
+                            if (m_eps.AreCoincident(p, m_kernel.Positions[j], factor)) return RepLate(j);
                     }
             return -1;
         }
@@ -398,6 +398,49 @@ namespace Aardvark.Geometry
             return m_eps.AreaSign(t[0], t[1], q, f) != Sign3.Below
                 && m_eps.AreaSign(t[1], t[2], q, f) != Sign3.Below
                 && m_eps.AreaSign(t[2], t[0], q, f) != Sign3.Below;
+        }
+
+        /// <summary>
+        /// Makes sure vid is insertable into tri's face CDT: if it lies
+        /// strictly outside an edge at its current factor (clip endpoints can
+        /// land marginally beyond a corner), the factor is widened to the
+        /// measured outside distance with GenerationFactor margin. Returns
+        /// false when even MaxFactor cannot absorb the offset — then the
+        /// point is genuinely outside the face.
+        /// </summary>
+        private bool EnsureInsertable(int tri, int vid)
+        {
+            var normal = m_kernel.Planes[m_kernel.TriPlane[tri]].Normal;
+            var q = Triangulator.ProjectDominant(normal, m_kernel.Positions[vid]);
+            Span<V2d> t = stackalloc V2d[3];
+            t[0] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T0[tri]]);
+            t[1] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T1[tri]]);
+            t[2] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T2[tri]]);
+            var det = (t[1] - t[0]).X * (t[2] - t[0]).Y - (t[1] - t[0]).Y * (t[2] - t[0]).X;
+            if (det == 0) return false;
+            if (det < 0) (t[1], t[2]) = (t[2], t[1]);
+
+            var needed = Eps.GenerationFactor;
+            for (var i = 0; i < 3; i++)
+            {
+                var a = t[i];
+                var b = t[(i + 1) % 3];
+                var d1 = b - a;
+                var d2 = q - a;
+                var d = d1.X * d2.Y - d1.Y * d2.X;
+                if (d >= 0) continue;
+                // factor that turns this strict Below into On (AreaSign tol
+                // model: eps * (m + l + Scene) * l * factor)
+                var m = Fun.Max(a.X.Abs(), a.Y.Abs(), b.X.Abs(), b.Y.Abs()).Max(
+                        Fun.Max(q.X.Abs(), q.Y.Abs()));
+                var l = Fun.Max(d1.X.Abs(), d1.Y.Abs(), d2.X.Abs(), d2.Y.Abs());
+                var denom = m_eps.Relative * (m + l + m_eps.Scene) * l;
+                if (denom <= 0) return false;
+                needed = needed.Max(Eps.GenerationFactor * -d / denom);
+            }
+            if (needed > Eps.MaxFactor) return false;
+            if (needed > m_kernel.TolFactor[vid]) BumpFactor(vid, needed);
+            return true;
         }
 
         /// <summary>Geometric winding normal of a kernel triangle (not normalized).</summary>
@@ -668,7 +711,8 @@ namespace Aardvark.Geometry
 
                 var w0 = OutlinePoint(u, v, t0, factor);
                 var w1 = OutlinePoint(u, v, t1, factor);
-                if (w0 != w1) AddConstraint(ta, w0, w1);
+                if (w0 != w1 && EnsureInsertable(ta, w0) && EnsureInsertable(ta, w1))
+                    AddConstraint(ta, w0, w1);
             }
         }
 
@@ -824,8 +868,8 @@ namespace Aardvark.Geometry
 
         private void AddConstraint(int tri, int v0, int v1)
         {
-            if (s_debugReg && tri == 77)
-                Console.WriteLine($"CON tri {tri}: ({v0},{v1}) {m_kernel.Positions[v0]} f{m_kernel.TolFactor[v0]:0.#} - {m_kernel.Positions[v1]} f{m_kernel.TolFactor[v1]:0.#}");
+            if (s_debugFace == tri.ToString())
+                Console.WriteLine($"CON tri {tri}: ({v0},{v1})");
             m_faceConstraints.GetOrCreate(tri, _ => new HashSet<(int, int)>()).Add(SortedEdge(v0, v1));
         }
 
@@ -837,6 +881,7 @@ namespace Aardvark.Geometry
 
         private void Subdivide()
         {
+            LateWeld();
             SplitConstraints();
 
             // T-junction pass: constraint endpoints that lie on a face's
@@ -863,11 +908,27 @@ namespace Aardvark.Geometry
                             var d = p[j] - p[i]; var w = q - p[i];
                             var dot = d.Dot(w);
                             if (dot <= 0 || dot >= d.LengthSquared) continue;
+                            if (s_debugFace == tri.ToString())
+                                Console.WriteLine($"TJREG tri {tri}: {e} on edge ({v[i]},{v[j]})");
                             RegisterEdgePoint(v[i], v[j], e);
                         }
                     }
                 }
             }
+
+            DedupeEdgeAssignments();
+            // the dedupe pass measured edge scatter and widened factors —
+            // re-weld so points that became coincident under honest factors
+            // unify before any face consumes them
+            LateWeld();
+            InsertabilityPrepass();
+            WeldEdgeResolution();
+            // welding redirects points to representatives the first pass never
+            // saw for a given face — re-check on the final ids (idempotent)
+            InsertabilityPrepass();
+            // the prepasses measured and widened factors again: points whose
+            // FINAL tolerances overlap must unify before faces consume them
+            LateWeld();
 
             // per-face triangulations run in parallel (read-only kernel,
             // private CDT state); assembly stays in face order → deterministic
@@ -883,27 +944,64 @@ namespace Aardvark.Geometry
                 var plane = m_kernel.Planes[m_kernel.TriPlane[tri]];
                 V2d Proj(int vid) => Triangulator.ProjectDominant(plane.Normal, m_kernel.Positions[vid]);
 
-                // face-level adaptive tolerance: the widest factor among the
-                // points this face must integrate (grazing cuts widen it)
-                var faceFactor = Eps.GenerationFactor;
-                if (constraints != null)
-                    foreach (var (ca, cb) in constraints)
-                        faceFactor = faceFactor.Max(m_kernel.TolFactor[ca]).Max(m_kernel.TolFactor[cb]);
-                if (boundary != null)
-                    foreach (var vid in boundary) faceFactor = faceFactor.Max(m_kernel.TolFactor[vid]);
-                if (m_faceFactorOverride.TryGetValue(tri, out var over)) faceFactor = faceFactor.Max(over);
+                var faceFactor = FaceFactor(tri);
 
+                if (s_debugFace == tri.ToString())
+                {
+                    Console.WriteLine($"FACE {tri}: factor {faceFactor:0.#}");
+                    if (constraints != null)
+                        foreach (var (ca, cb) in constraints)
+                            Console.WriteLine($"  constraint ({ca},{cb}) {m_kernel.Positions[ca]} f{m_kernel.TolFactor[ca]:0.#} - {m_kernel.Positions[cb]} f{m_kernel.TolFactor[cb]:0.#}");
+                    if (boundary != null)
+                        foreach (var vid in boundary)
+                            Console.WriteLine($"  boundary {vid} {m_kernel.Positions[vid]} f{m_kernel.TolFactor[vid]:0.#}");
+                    Span<int> dv = stackalloc int[] { m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri] };
+                    for (var i = 0; i < 3; i++)
+                    {
+                        var pts = m_edgePoints.GetOrDefault(SortedEdge(dv[i], dv[(i + 1) % 3]));
+                        if (pts != null)
+                            Console.WriteLine($"  edge ({dv[i]},{dv[(i + 1) % 3]}): {string.Join(",", pts)}");
+                    }
+                }
                 var cdt = FaceCdt.Rent(m_eps, faceFactor,
                     m_kernel.T0[tri], Proj(m_kernel.T0[tri]),
                     m_kernel.T1[tri], Proj(m_kernel.T1[tri]),
                     m_kernel.T2[tri], Proj(m_kernel.T2[tri]));
 
-                if (boundary != null)
-                    foreach (var vid in boundary)
+                // boundary points are committed to their edge: subdivide each
+                // face edge as an explicit chain ordered by 3D parameter —
+                // identical order and positions in both faces sharing the
+                // edge, with 2D positions lerped exactly onto the edge
+                Span<int> cv = stackalloc int[] { m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri] };
+                for (var i = 0; i < 3; i++)
+                {
+                    var eu = cv[i]; var ev = cv[(i + 1) % 3];
+                    var pts = m_edgePoints.GetOrDefault(SortedEdge(eu, ev));
+                    if (pts == null || pts.Count == 0) continue;
+                    var (su, sv) = SortedEdge(eu, ev);
+                    var pu3 = m_kernel.Positions[su];
+                    var dir3 = m_kernel.Positions[sv] - pu3;
+                    var len23 = dir3.LengthSquared;
+                    var ordered = new List<(double T, int Vid)>(pts.Count);
+                    foreach (var vid in pts)
+                        ordered.Add(((dir3.Dot(m_kernel.Positions[vid] - pu3) / len23).Clamp(0.0, 1.0), vid));
+                    ordered.Sort();
+                    var u2 = Proj(su); var v2 = Proj(sv);
+                    // all decisions below are made on the shared parameter t,
+                    // so both faces consuming this edge subdivide identically
+                    const double tSnap = 1e-12;
+                    var prev = su; var prevT = 0.0;
+                    foreach (var (t, vid) in ordered)
                     {
-                        try { cdt.InsertPoint(vid, Proj(vid)); }
+                        if (cdt.KnowsKernel(vid)) continue;
+                        if (t <= tSnap) { cdt.AliasKernel(vid, su); continue; }
+                        if (t >= 1 - tSnap) { cdt.AliasKernel(vid, sv); continue; }
+                        if (t - prevT <= tSnap) { cdt.AliasKernel(vid, prev); continue; }
+                        try { cdt.InsertOnEdge(prev, sv, vid, u2 + t * (v2 - u2)); }
                         catch (CsgVerificationException e) { throw new CsgVerificationException(Diag(e, vid)); }
+                        prev = vid; prevT = t;
                     }
+                }
                 if (constraints != null)
                 {
                     foreach (var (ca, cb) in constraints)
@@ -1083,6 +1181,281 @@ namespace Aardvark.Geometry
             }
 
             static double Det(V2d u, V2d v) => u.X * v.Y - u.Y * v.X;
+        }
+
+        /// <summary>
+        /// Face-level adaptive tolerance: the widest factor among the points
+        /// this face must integrate (grazing cuts widen it).
+        /// </summary>
+        private double FaceFactor(int tri)
+        {
+            var f = Eps.GenerationFactor;
+            var constraints = m_faceConstraints.GetOrDefault(tri);
+            if (constraints != null)
+                foreach (var (ca, cb) in constraints)
+                    f = f.Max(m_kernel.TolFactor[ca]).Max(m_kernel.TolFactor[cb]);
+            var boundary = BoundaryPoints(tri);
+            if (boundary != null)
+                foreach (var vid in boundary) f = f.Max(m_kernel.TolFactor[vid]);
+            if (m_faceFactorOverride.TryGetValue(tri, out var over)) f = f.Max(over);
+            return f;
+        }
+
+        /// <summary>
+        /// Late global weld: derived points are created and grid-welded at
+        /// creation-time factors, but later passes measure and widen those
+        /// factors. Two points whose FINAL tolerances overlap are semantically
+        /// one point — leaving them distinct lets different faces pick
+        /// different ids for the same geometric location, which surfaces as
+        /// cracks (open edges) along shared curves. Input vertices are never
+        /// aliased away; the smallest id wins.
+        /// </summary>
+        private readonly Dictionary<int, int> m_lateAlias = new();
+
+        private int RepLate(int v) { while (m_lateAlias.TryGetValue(v, out var r)) v = r; return v; }
+
+        private void LateWeld()
+        {
+            var inputCount = 0;
+            foreach (var c in m_kernel.VertexCount) inputCount += c;
+            var alias = m_lateAlias;
+            var before = alias.Count;
+            int Rep(int v) { while (alias.TryGetValue(v, out var r)) v = r; return v; }
+
+            for (var vid = 0; vid < m_kernel.Positions.Count; vid++)
+            {
+                var f = m_kernel.TolFactor[vid];
+                // creation-time welding already covered baseline factors
+                if (f <= Eps.GenerationFactor || alias.ContainsKey(vid)) continue;
+                var p = m_kernel.Positions[vid];
+                var tol = m_eps.Relative * (p.NormMax + 2 * m_eps.Scene) * f;
+                var fine = f <= 3 * Eps.GenerationFactor;
+                var h = fine ? m_gridH : m_coarseH;
+                var heads = fine ? m_vertexGridHeads : m_coarseHeads;
+                var next = fine ? m_vertexGridNext : m_coarseNext;
+                var cx0 = (long)Fun.Floor((p.X - tol) / h); var cx1 = (long)Fun.Floor((p.X + tol) / h);
+                var cy0 = (long)Fun.Floor((p.Y - tol) / h); var cy1 = (long)Fun.Floor((p.Y + tol) / h);
+                var cz0 = (long)Fun.Floor((p.Z - tol) / h); var cz1 = (long)Fun.Floor((p.Z + tol) / h);
+                for (var dx = cx0; dx <= cx1; dx++)
+                    for (var dy = cy0; dy <= cy1; dy++)
+                        for (var dz = cz0; dz <= cz1; dz++)
+                        {
+                            if (!heads.TryGetValue(CellKey(dx, dy, dz), out var j)) continue;
+                            for (; j >= 0; j = next[j])
+                            {
+                                if (j == vid) continue;
+                                var pf = f.Max(m_kernel.TolFactor[j]);
+                                if (!m_eps.AreCoincident(p, m_kernel.Positions[j], pf)) continue;
+                                var lo = Math.Min(vid, j);
+                                var hi = Math.Max(vid, j);
+                                if (hi < inputCount || alias.ContainsKey(hi)) continue;
+                                var target = Rep(lo);
+                                if (target == hi) continue;
+                                alias[hi] = target;
+                                m_kernel.TolFactor[target] = m_kernel.TolFactor[target].Max(m_kernel.TolFactor[hi]);
+                            }
+                        }
+            }
+            if (alias.Count == before) return;
+
+            foreach (var (_, constraints) in m_faceConstraints)
+            {
+                var segs = new List<(int, int)>(constraints);
+                constraints.Clear();
+                foreach (var (a, b) in segs)
+                {
+                    var ra = Rep(a);
+                    var rb = Rep(b);
+                    if (ra != rb) constraints.Add(SortedEdge(ra, rb));
+                }
+            }
+            foreach (var (edge, pts) in m_edgePoints)
+            {
+                var (u, w) = edge;
+                var mapped = new List<int>();
+                foreach (var p in pts)
+                {
+                    var r = Rep(p);
+                    if (r != u && r != w && !mapped.Contains(r)) mapped.Add(r);
+                }
+                pts.Clear();
+                foreach (var p in mapped) pts.Add(p);
+            }
+        }
+
+        /// <summary>
+        /// Insertability prepass (sequential — bumps shared factors): every
+        /// point a face will consume must be absorbable by that face; clip
+        /// scatter and cross-projection drift can push points marginally
+        /// outside, which EnsureInsertable converts into a measured factor.
+        /// </summary>
+        /// <summary>
+        /// A point registered on several edges (corner-region T-junction
+        /// registrations) must subdivide exactly one of them, chosen globally
+        /// (3D distance to the edge segment — face-independent), or the faces
+        /// sharing those edges disagree about their subdivision chains.
+        /// </summary>
+        private void DedupeEdgeAssignments()
+        {
+            // a point may legitimately subdivide several edges at once
+            // (edge-face intersections across meshes, edge-edge cuts); only
+            // registrations on edges SHARING a vertex are corner-region
+            // conflicts where faces would disagree about their chains
+            var edgesOf = new Dictionary<int, List<(int, int)>>();
+            foreach (var (edge, pts) in m_edgePoints)
+                foreach (var vid in pts)
+                    edgesOf.GetOrCreate(vid, _ => new List<(int, int)>()).Add(edge);
+
+            double Dist2(int vid, (int, int) edge)
+            {
+                var a = m_kernel.Positions[edge.Item1];
+                var d = m_kernel.Positions[edge.Item2] - a;
+                var w = m_kernel.Positions[vid] - a;
+                var t = (d.Dot(w) / d.LengthSquared.Max(1e-300)).Clamp(0.0, 1.0);
+                return (w - t * d).LengthSquared;
+            }
+
+            // registration is an On-commitment to the edge: the measured
+            // distance to it is a lower bound on the point's real scatter, so
+            // widen dishonest factors here — the resolution weld then absorbs
+            // corner-region points globally instead of per-face guesswork
+            foreach (var (edge, pts) in m_edgePoints)
+                foreach (var vid in pts)
+                {
+                    var dist = Dist2(vid, edge).Sqrt();
+                    var p = m_kernel.Positions[vid];
+                    var needed = Eps.GenerationFactor * dist
+                        / (m_eps.Relative * (2 * p.NormMax + m_eps.Scene));
+                    if (needed > m_kernel.TolFactor[vid])
+                        BumpFactor(vid, needed.Min(Eps.MaxFactor));
+                }
+
+            foreach (var (vid, edges) in edgesOf)
+            {
+                if (edges.Count < 2) continue;
+                edges.Sort();
+                for (var i = 0; i < edges.Count; i++)
+                    for (var j = i + 1; j < edges.Count; j++)
+                    {
+                        var (a, b) = edges[i]; var (c, d) = edges[j];
+                        if (a != c && a != d && b != c && b != d) continue;
+                        var loser = Dist2(vid, edges[i]) <= Dist2(vid, edges[j]) ? edges[j] : edges[i];
+                        m_edgePoints[loser].Remove(vid);
+                    }
+            }
+        }
+
+        private void InsertabilityPrepass()
+        {
+            // boundary points need no check: they are chain-inserted exactly
+            // on their committed edge, which is always inside the face —
+            // constraint endpoints that are edge-registered count as boundary
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                var constraints = m_faceConstraints.GetOrDefault(tri);
+                if (constraints == null) continue;
+                var onEdge = BoundaryPoints(tri);
+                bool Ok(int vid) => vid == m_kernel.T0[tri] || vid == m_kernel.T1[tri] || vid == m_kernel.T2[tri]
+                    || (onEdge != null && onEdge.Contains(vid)) || EnsureInsertable(tri, vid);
+                constraints.RemoveWhere(seg => !Ok(seg.Item1) || !Ok(seg.Item2));
+            }
+        }
+
+        /// <summary>
+        /// Global resolution welding along subdivided input edges: a split
+        /// point within the working resolution of an edge endpoint (at the
+        /// widest factor of any face consuming the edge) cannot form a
+        /// recoverable sub-edge in the face CDTs — its flap triangle is
+        /// degenerate at that factor and constraint recovery on the
+        /// sub-resolution segment has no strict crossing to flip. Such points
+        /// are aliased to the endpoint (or to their neighbor split point)
+        /// globally, so every face sharing the edge subdivides identically.
+        /// </summary>
+        private void WeldEdgeResolution()
+        {
+            if (m_edgePoints.Count == 0) return;
+
+            // widest face factor consuming each subdivided edge
+            var edgeFactor = new Dictionary<(int, int), double>();
+            for (var tri = 0; tri < m_kernel.TriangleCount; tri++)
+            {
+                Span<int> v = stackalloc int[] { m_kernel.T0[tri], m_kernel.T1[tri], m_kernel.T2[tri] };
+                var touches = false;
+                for (var i = 0; i < 3 && !touches; i++)
+                    touches = m_edgePoints.ContainsKey(SortedEdge(v[i], v[(i + 1) % 3]));
+                if (!touches) continue;
+                var f = FaceFactor(tri);
+                for (var i = 0; i < 3; i++)
+                {
+                    var e = SortedEdge(v[i], v[(i + 1) % 3]);
+                    if (!m_edgePoints.ContainsKey(e)) continue;
+                    edgeFactor[e] = edgeFactor.TryGetValue(e, out var old) ? old.Max(f) : f;
+                }
+            }
+
+            var alias = new Dictionary<int, int>();
+            int Rep(int v) { while (alias.TryGetValue(v, out var r)) v = r; return v; }
+
+            bool SubRes(int p, int q, double f)
+            {
+                var a = m_kernel.Positions[p];
+                var b = m_kernel.Positions[q];
+                var tol = m_eps.Relative * (a.NormMax + b.NormMax + m_eps.Scene) * f * Eps.GenerationFactor;
+                return (a - b).NormMax <= tol;
+            }
+
+            foreach (var (edge, pts) in m_edgePoints)
+            {
+                if (!edgeFactor.TryGetValue(edge, out var f)) continue;
+                var (u, w) = edge;
+                var dir = m_kernel.Positions[w] - m_kernel.Positions[u];
+                var sorted = new List<int>(pts);
+                sorted.Sort((x, y) => dir.Dot(m_kernel.Positions[x]).CompareTo(dir.Dot(m_kernel.Positions[y])));
+                var prev = u;
+                foreach (var p0 in sorted)
+                {
+                    var p = Rep(p0);
+                    if (p == u || p == w || alias.ContainsKey(p)) continue;
+                    var target = SubRes(p, prev, f) ? prev : SubRes(p, w, f) ? w : -1;
+                    if (target >= 0)
+                    {
+                        // resolve the target too: aliases must always point at
+                        // a currently-unaliased representative or later
+                        // assignments can close a cycle
+                        target = Rep(target);
+                        if (target == p) continue;
+                        alias[p] = target;
+                        m_kernel.TolFactor[target] = m_kernel.TolFactor[target].Max(m_kernel.TolFactor[p]);
+                    }
+                    else prev = p;
+                }
+            }
+            if (alias.Count == 0) return;
+
+            // rewrite the registries through the alias map
+            foreach (var (edge, pts) in m_edgePoints)
+            {
+                var (u, w) = edge;
+                var mapped = new List<int>();
+                foreach (var p in pts)
+                {
+                    var r = Rep(p);
+                    if (r != u && r != w && !mapped.Contains(r)) mapped.Add(r);
+                }
+                pts.Clear();
+                foreach (var p in mapped) pts.Add(p);
+            }
+            foreach (var (_, constraints) in m_faceConstraints)
+            {
+                var segs = new List<(int, int)>(constraints);
+                constraints.Clear();
+                foreach (var (a, b) in segs)
+                {
+                    var ra = Rep(a);
+                    var rb = Rep(b);
+                    if (ra != rb) constraints.Add(SortedEdge(ra, rb));
+                }
+            }
         }
 
         private List<int>? BoundaryPoints(int tri)
