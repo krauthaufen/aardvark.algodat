@@ -261,6 +261,128 @@ namespace Aardvark.Geometry.Tests
 
         [Test]
         [Explicit]
+        public void TangentDump()
+        {
+            var path = System.IO.Path.Combine(TestContext.CurrentContext.TestDirectory, "PolyMesh", "manifold-cases.json.gz");
+            using var stream = new System.IO.Compression.GZipStream(System.IO.File.OpenRead(path), System.IO.Compression.CompressionMode.Decompress);
+            var doc = System.Text.Json.JsonDocument.Parse(stream);
+            foreach (var c in doc.RootElement.GetProperty("cases").EnumerateArray())
+            {
+                if (c.GetProperty("name").GetString() != "sphere-near-tangent") continue; // tangent case
+                PolyMesh Mesh(System.Text.Json.JsonElement e)
+                {
+                    var vs = e.GetProperty("vertices").EnumerateArray().Select(x => x.GetDouble()).ToArray();
+                    var ts = e.GetProperty("triangles").EnumerateArray().Select(x => x.GetInt32()).ToArray();
+                    var pos = new V3d[vs.Length / 3].SetByIndex(i => new V3d(vs[i * 3], vs[i * 3 + 1], vs[i * 3 + 2]));
+                    var fia = new int[ts.Length / 3 + 1].SetByIndex(i => i * 3);
+                    return new PolyMesh { PositionArray = pos, FirstIndexArray = fia, VertexIndexArray = ts };
+                }
+                var a = Mesh(c.GetProperty("a"));
+                var b = Mesh(c.GetProperty("b"));
+                foreach (var mt in new[] { 1, 8 })
+                    foreach (var (opName, op) in new (string, Func<CsgOptions, PolyMesh[]>)[]
+                    {
+                        ("union", o => Csg.Union(a, b, o)), ("inter", o => Csg.Intersection(a, b, o)), ("diff", o => Csg.Difference(a, b, o)),
+                    })
+                    {
+                        try { var r = op(new CsgOptions { MaxThreads = mt }); Console.WriteLine($"API {opName} mt={mt}: ok ({r.Sum(m => m.FirstIndexArray.Length - 1)} tris)"); }
+                        catch (Exception ex) { Console.WriteLine($"API {opName} mt={mt}: FAIL {ex.Message}"); }
+                    }
+                var kernel = new Kernel(new Eps(1e-11));
+                kernel.Ingest(a, 0);
+                kernel.Ingest(b, 1);
+                var pipe = new Pipeline(kernel, maxThreads: 1);
+                pipe.Run();
+                foreach (var (op, sel) in new (string, Func<int, FragLabel, bool>)[]
+                {
+                    ("union", (mi, l) => l == FragLabel.Outside || (l == FragLabel.OnSame && mi == 0)),
+                    ("inter", (mi, l) => l == FragLabel.Inside || (l == FragLabel.OnSame && mi == 0)),
+                    ("diffA", (mi, l) => mi == 0 ? l is FragLabel.Outside or FragLabel.OnOpposite : l == FragLabel.Inside),
+                })
+                {
+                var kept = new System.Collections.Generic.List<int>();
+                for (var f = 0; f < pipe.Fragments.Count; f++)
+                {
+                    var mi = kernel.TriMesh[pipe.Fragments[f].Parent];
+                    var l = pipe.Label(f, 1 - mi);
+                    if (sel(mi, l)) kept.Add(f);
+                }
+                Console.WriteLine($"== {op}: {kept.Count} fragments");
+                var dir = new System.Collections.Generic.Dictionary<(int, int), int>();
+                foreach (var f in kept)
+                {
+                    var fr = pipe.Fragments[f];
+                    foreach (var (u, v) in new[] { (fr.V0, fr.V1), (fr.V1, fr.V2), (fr.V2, fr.V0) })
+                        dir[(u, v)] = f;
+                }
+                if (op == "union")
+                {
+                    Console.WriteLine("fragments at kernel edge (2054,2055):");
+                    for (var f = 0; f < pipe.Fragments.Count; f++)
+                    {
+                        var fr = pipe.Fragments[f];
+                        var vs3 = new[] { fr.V0, fr.V1, fr.V2 };
+                        if (!vs3.Contains(2054) || !vs3.Contains(2055)) continue;
+                        var mi = kernel.TriMesh[fr.Parent];
+                        var p0 = kernel.Positions[fr.V0];
+                        var wn = (kernel.Positions[fr.V1] - p0).Cross(kernel.Positions[fr.V2] - p0).Normalized;
+                        Console.WriteLine($"   frag {f} mesh {mi} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) " +
+                            $"labels[{pipe.Label(f, 0)},{pipe.Label(f, 1)}] kept={kept.Contains(f)} n=({wn.X:0.###},{wn.Y:0.###},{wn.Z:0.###})");
+                    }
+                }
+                var shown = 0;
+                foreach (var kvp in dir)
+                {
+                    var (u, v) = kvp.Key;
+                    if (dir.ContainsKey((v, u))) continue;
+                    if (shown++ >= 3) break;
+                    Console.WriteLine($"OPEN {u}->{v}: {kernel.Positions[u]} -> {kernel.Positions[v]} f[{kernel.TolFactor[u]:0.#},{kernel.TolFactor[v]:0.#}]");
+                    for (var f = 0; f < pipe.Fragments.Count; f++)
+                    {
+                        var fr = pipe.Fragments[f];
+                        var vs2 = new[] { fr.V0, fr.V1, fr.V2 };
+                        if (!vs2.Contains(u) || !vs2.Contains(v)) continue;
+                        var mi = kernel.TriMesh[fr.Parent];
+                        Console.WriteLine($"   frag {f} mesh {mi} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) " +
+                            $"labels [{pipe.Label(f, 0)},{pipe.Label(f, 1)}] kept={kept.Contains(f)}");
+                    }
+                }
+                }
+            }
+        }
+
+        [Test]
+        [Explicit]
+        public void SelfDump()
+        {
+            var path = System.IO.Path.Combine(TestContext.CurrentContext.TestDirectory, "PolyMesh", "external-cases.json.gz");
+            using var stream = new System.IO.Compression.GZipStream(System.IO.File.OpenRead(path), System.IO.Compression.CompressionMode.Decompress);
+            var doc = System.Text.Json.JsonDocument.Parse(stream);
+            foreach (var c in doc.RootElement.GetProperty("cases").EnumerateArray())
+            {
+                if (c.GetProperty("name").GetString() != Environment.GetEnvironmentVariable("CSG_CASE")) continue;
+                PolyMesh Mesh(System.Text.Json.JsonElement e)
+                {
+                    var vs = e.GetProperty("vertices").EnumerateArray().Select(x => x.GetDouble()).ToArray();
+                    var ts = e.GetProperty("triangles").EnumerateArray().Select(x => x.GetInt32()).ToArray();
+                    var pos = new V3d[vs.Length / 3].SetByIndex(i => new V3d(vs[i * 3], vs[i * 3 + 1], vs[i * 3 + 2]));
+                    var fia = new int[ts.Length / 3 + 1].SetByIndex(i => i * 3);
+                    return new PolyMesh { PositionArray = pos, FirstIndexArray = fia, VertexIndexArray = ts };
+                }
+                var a = Mesh(c.GetProperty("a"));
+                var b = Mesh(c.GetProperty("b"));
+                Environment.SetEnvironmentVariable("CSG_DEBUG_REG", "1");
+                var kernel = new Kernel(new Eps(1e-11));
+                kernel.Ingest(a, 0);
+                kernel.Ingest(b, 1);
+                var pipe = new Pipeline(kernel, maxThreads: 1);
+                try { pipe.Run(); Console.WriteLine("pipeline ok"); }
+                catch (Exception ex) { Console.WriteLine($"pipeline FAIL: {ex.Message}"); }
+            }
+        }
+
+        [Test]
+        [Explicit]
         public void PerfPrepared()
         {
             var a = CsgMesh.FromPolyMesh(CsgM5Tests.Icosphere(V3d.Zero, 1.0, 6));

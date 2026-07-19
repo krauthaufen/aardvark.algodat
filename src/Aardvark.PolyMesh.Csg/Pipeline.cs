@@ -382,6 +382,24 @@ namespace Aardvark.Geometry
             }
         }
 
+        /// <summary>Point inside-or-on the triangle's 2D projection, at the point's tolerance factor.</summary>
+        private bool WithinFace(int tri, int vid)
+        {
+            var normal = m_kernel.Planes[m_kernel.TriPlane[tri]].Normal;
+            var q = Triangulator.ProjectDominant(normal, m_kernel.Positions[vid]);
+            Span<V2d> t = stackalloc V2d[3];
+            t[0] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T0[tri]]);
+            t[1] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T1[tri]]);
+            t[2] = Triangulator.ProjectDominant(normal, m_kernel.Positions[m_kernel.T2[tri]]);
+            var det = (t[1] - t[0]).X * (t[2] - t[0]).Y - (t[1] - t[0]).Y * (t[2] - t[0]).X;
+            if (det == 0) return false;
+            if (det < 0) (t[1], t[2]) = (t[2], t[1]);
+            var f = m_kernel.TolFactor[vid].Max(Eps.GenerationFactor);
+            return m_eps.AreaSign(t[0], t[1], q, f) != Sign3.Below
+                && m_eps.AreaSign(t[1], t[2], q, f) != Sign3.Below
+                && m_eps.AreaSign(t[2], t[0], q, f) != Sign3.Below;
+        }
+
         /// <summary>Geometric winding normal of a kernel triangle (not normalized).</summary>
         private V3d WindingNormal(int t)
         {
@@ -465,11 +483,49 @@ namespace Aardvark.Geometry
         {
             public readonly PairKind Kind;
             public readonly bool CoplanarSame;
+            public readonly double CoplanarFactor;   // measured slab of the coplanar pair (8 = exact)
             public readonly CrossPt Lo, Hi;
             public readonly int LoCutPlane, HiCutPlane;
-            public PairResult(bool same) { Kind = PairKind.Coplanar; CoplanarSame = same; Lo = Hi = default; LoCutPlane = HiCutPlane = 0; }
+            public PairResult(bool same, double coplanarFactor)
+            { Kind = PairKind.Coplanar; CoplanarSame = same; CoplanarFactor = coplanarFactor; Lo = Hi = default; LoCutPlane = HiCutPlane = 0; }
             public PairResult(CrossPt lo, int loPlane, CrossPt hi, int hiPlane)
-            { Kind = PairKind.Segment; CoplanarSame = false; Lo = lo; LoCutPlane = loPlane; Hi = hi; HiCutPlane = hiPlane; }
+            { Kind = PairKind.Segment; CoplanarSame = false; CoplanarFactor = 0; Lo = lo; LoCutPlane = loPlane; Hi = hi; HiCutPlane = hiPlane; }
+        }
+
+        /// <summary>
+        /// Measured tolerance factor of a coplanar pair: the widest mutual
+        /// vertex height, in eps units — computed from the pair's OWN geometry
+        /// (winding-normal planes), independent of group snapping, so exactly
+        /// coplanar pairs measure exact even inside a larger welded group.
+        /// </summary>
+        private double CoplanarSlabFactor(Span<int> va, Span<int> vb, int pa)
+        {
+            var na = WindingNormal(0, va).Normalized;
+            var da = na.Dot(m_kernel.Positions[va[0]]);
+            var planeA = new Plane3d(na, da);
+            var nb = WindingNormal(0, vb).Normalized;
+            var db = nb.Dot(m_kernel.Positions[vb[0]]);
+            var planeB = new Plane3d(nb, db);
+            var f = Eps.GenerationFactor;
+            for (var i = 0; i < 3; i++)
+            {
+                f = f.Max(HeightFactor(planeB, m_kernel.Positions[va[i]]));
+                f = f.Max(HeightFactor(planeA, m_kernel.Positions[vb[i]]));
+            }
+            return f.Min(Eps.MaxFactor);
+        }
+
+        private V3d WindingNormal(int _, Span<int> v)
+        {
+            var p0 = m_kernel.Positions[v[0]];
+            return (m_kernel.Positions[v[1]] - p0).Cross(m_kernel.Positions[v[2]] - p0);
+        }
+
+        private double HeightFactor(in Plane3d plane, in V3d p)
+        {
+            var h = (plane.Normal.Dot(p) - plane.Distance).Abs();
+            var unit = m_eps.Relative * (p.X.Abs() + p.Y.Abs() + p.Z.Abs() + plane.Distance.Abs() + m_eps.Scene);
+            return unit > 0 ? h / unit : 0.0;
         }
 
         /// <summary>
@@ -491,7 +547,7 @@ namespace Aardvark.Geometry
             if (m_planeGroup[pa] == m_planeGroup[pb])
             {
                 if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
-                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0);
+                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0, CoplanarSlabFactor(va, vb, pa));
             }
 
             Span<Sign3> sb = stackalloc Sign3[3];
@@ -504,7 +560,7 @@ namespace Aardvark.Geometry
             if (AllOn(sa) && AllOn(sb))
             {
                 if (!CoplanarInteriorsOverlap(va, vb, pa)) return default;
-                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0);
+                return new PairResult(WindingNormal(ta).Dot(WindingNormal(tb)) > 0, Eps.GenerationFactor);
             }
 
             var crossA = CrossingPoints(va, sa, pb);
@@ -531,18 +587,31 @@ namespace Aardvark.Geometry
                 case PairKind.Coplanar:
                     m_coplanar.GetOrCreate(ta, _ => new List<(int, bool)>()).Add((tb, r.CoplanarSame));
                     m_coplanar.GetOrCreate(tb, _ => new List<(int, bool)>()).Add((ta, r.CoplanarSame));
-                    // the coverage outline must be explicit constraints: for
-                    // exactly-coplanar faces the side-face pairs provide the
-                    // curves, but welded (approximately coplanar) faces need
-                    // the outline itself, and it must weld consistently with
-                    // the neighboring real cuts
-                    AddCoplanarOutline(ta, tb);
-                    AddCoplanarOutline(tb, ta);
+                    // exactly-coplanar faces (slab within the baseline factor)
+                    // keep the original path: side-face pairs provide the
+                    // curves. Approximately welded faces need explicit outline
+                    // constraints so coverage boundaries weld consistently
+                    // with the neighboring real cuts.
+                    if (s_debugReg && (ta == 77 || tb == 77))
+                        Console.WriteLine($"COPL ta {ta} tb {tb} same={r.CoplanarSame} slab={r.CoplanarFactor:0.#}");
+                    if (r.CoplanarFactor > 4 * Eps.GenerationFactor)
+                    {
+                        AddCoplanarOutline(ta, tb, r.CoplanarFactor);
+                        AddCoplanarOutline(tb, ta, r.CoplanarFactor);
+                        Bump(m_faceFactorOverride, ta, r.CoplanarFactor);
+                        Bump(m_faceFactorOverride, tb, r.CoplanarFactor);
+                    }
                     return;
                 case PairKind.Segment:
                     var v0 = Materialize(r.Lo, r.LoCutPlane);
                     var v1 = Materialize(r.Hi, r.HiCutPlane);
                     if (v0 == v1) return;
+                    // a segment is only real if both endpoints lie inside-or-on
+                    // BOTH faces within their tolerance factors; grazing
+                    // vertex-adjacent pairs can produce sub-resolution
+                    // micro-segments scattered outside the faces — dropped
+                    if (!WithinFace(ta, v0) || !WithinFace(ta, v1)
+                        || !WithinFace(tb, v0) || !WithinFace(tb, v1)) return;
                     AddConstraint(ta, v0, v1);
                     AddConstraint(tb, v0, v1);
                     return;
@@ -559,7 +628,15 @@ namespace Aardvark.Geometry
         /// with the tolerance-factor cap (they live on welded planes) and are
         /// registered on tb's edges so both sides subdivide consistently.
         /// </summary>
-        private void AddCoplanarOutline(int ta, int tb)
+        private readonly Dictionary<int, double> m_faceFactorOverride = new();
+
+        private static void Bump(Dictionary<int, double> d, int key, double f)
+        {
+            d.TryGetValue(key, out var cur);
+            if (f > cur) d[key] = f;
+        }
+
+        private void AddCoplanarOutline(int ta, int tb, double factor)
         {
             var normal = m_kernel.Planes[m_kernel.TriPlane[ta]].Normal;
             Span<int> va = stackalloc int[] { m_kernel.T0[ta], m_kernel.T1[ta], m_kernel.T2[ta] };
@@ -589,25 +666,27 @@ namespace Aardvark.Geometry
                 }
                 if (t1 - t0 <= 1e-9) continue;
 
-                var w0 = OutlinePoint(u, v, t0);
-                var w1 = OutlinePoint(u, v, t1);
+                var w0 = OutlinePoint(u, v, t0, factor);
+                var w1 = OutlinePoint(u, v, t1, factor);
                 if (w0 != w1) AddConstraint(ta, w0, w1);
             }
         }
 
-        private int OutlinePoint(int u, int v, double t)
+        private int OutlinePoint(int u, int v, double t, double factor)
         {
-            if (t <= 0) return u;
-            if (t >= 1) return v;
+            // endpoints participate in welded-plane geometry: their position
+            // relative to that neighborhood is only known to the slab factor
+            if (t <= 0) { BumpFactor(u, (4 * factor).Min(Eps.MaxFactor)); return u; }
+            if (t >= 1) { BumpFactor(v, (4 * factor).Min(Eps.MaxFactor)); return v; }
             var p = m_kernel.Positions[u] + t * (m_kernel.Positions[v] - m_kernel.Positions[u]);
-            if (m_eps.AreCoincident(p, m_kernel.Positions[u], Eps.MaxFactor)) return u;
-            if (m_eps.AreCoincident(p, m_kernel.Positions[v], Eps.MaxFactor)) return v;
-            var vid = GridFindCoincident(p, Eps.MaxFactor);
+            if (m_eps.AreCoincident(p, m_kernel.Positions[u], factor)) return u;
+            if (m_eps.AreCoincident(p, m_kernel.Positions[v], factor)) return v;
+            var vid = GridFindCoincident(p, factor);
             if (vid < 0)
             {
                 vid = m_kernel.Positions.Count;
                 m_kernel.Positions.Add(p);
-                m_kernel.TolFactor.Add(Eps.MaxFactor);
+                m_kernel.TolFactor.Add(factor);
                 GridAdd(vid);
             }
             RegisterEdgePoint(u, v, vid);
@@ -730,6 +809,11 @@ namespace Aardvark.Geometry
             return vid;
         }
 
+        private void BumpFactor(int vid, double factor)
+        {
+            if (m_kernel.TolFactor[vid] < factor) m_kernel.TolFactor[vid] = factor;
+        }
+
         private void RegisterEdgePoint(int a, int b, int vid)
             => m_edgePoints.GetOrCreate(SortedEdge(a, b), _ => new HashSet<int>()).Add(vid);
 
@@ -739,7 +823,13 @@ namespace Aardvark.Geometry
             => a < b ? ((long)a << 32) | (uint)b : ((long)b << 32) | (uint)a;
 
         private void AddConstraint(int tri, int v0, int v1)
-            => m_faceConstraints.GetOrCreate(tri, _ => new HashSet<(int, int)>()).Add(SortedEdge(v0, v1));
+        {
+            if (s_debugReg && tri == 77)
+                Console.WriteLine($"CON tri {tri}: ({v0},{v1}) {m_kernel.Positions[v0]} f{m_kernel.TolFactor[v0]:0.#} - {m_kernel.Positions[v1]} f{m_kernel.TolFactor[v1]:0.#}");
+            m_faceConstraints.GetOrCreate(tri, _ => new HashSet<(int, int)>()).Add(SortedEdge(v0, v1));
+        }
+
+        private static readonly bool s_debugReg = Environment.GetEnvironmentVariable("CSG_DEBUG_REG") != null;
 
         #endregion
 
@@ -801,6 +891,7 @@ namespace Aardvark.Geometry
                         faceFactor = faceFactor.Max(m_kernel.TolFactor[ca]).Max(m_kernel.TolFactor[cb]);
                 if (boundary != null)
                     foreach (var vid in boundary) faceFactor = faceFactor.Max(m_kernel.TolFactor[vid]);
+                if (m_faceFactorOverride.TryGetValue(tri, out var over)) faceFactor = faceFactor.Max(over);
 
                 var cdt = FaceCdt.Rent(m_eps, faceFactor,
                     m_kernel.T0[tri], Proj(m_kernel.T0[tri]),

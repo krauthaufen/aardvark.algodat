@@ -397,19 +397,65 @@ namespace Aardvark.Geometry
                         var r = k.Positions[w] - k.Positions[u];
                         var angle = Fun.Atan2(r.Dot(ax2), r.Dot(ax1));
                         var forward = Corner(tris[h.Tri], h.Slot) == u;
-                        return (H: h, Angle: angle, Forward: forward);
+                        return (H: h, Angle: angle, Forward: forward, Mesh: (int)k.TriMesh[t.Parent]);
                     }).ToArray();
                     Array.Sort(around, (x, y) =>
                         (x.Angle - y.Angle).Abs() < 1e-9
                             ? x.Forward.CompareTo(y.Forward)
                             : x.Angle.CompareTo(y.Angle));
-                    for (var i = 0; i < around.Length; i++)
+
+                    var paired = new bool[around.Length];
+                    void PairCycle(List<int> active)
                     {
-                        var a = around[i];
-                        var b = around[(i + 1) % around.Length];
-                        if (!a.Forward && b.Forward) Pair(a.H, b.H);
-                        // other consecutive combinations bound void sectors, or
-                        // indicate broken geometry (the verifier reports those)
+                        var made = true;
+                        while (made)
+                        {
+                            made = false;
+                            for (var i = 0; i < active.Count; i++)
+                            {
+                                var a = active[i];
+                                var b = active[(i + 1) % active.Count];
+                                if (a == b || paired[a] || paired[b]) continue;
+                                if (!around[a].Forward && around[b].Forward)
+                                {
+                                    Pair(around[a].H, around[b].H);
+                                    paired[a] = true; paired[b] = true;
+                                    made = true;
+                                }
+                            }
+                            if (made) active.RemoveAll(i => paired[i]);
+                        }
+                    }
+
+                    // count distinct dihedral angle clusters: sheets at real
+                    // wedge angles pair angularly; coincident/grazing sheets
+                    // (≤ 2 clusters) have no meaningful angular order — each
+                    // surface continues through within its own mesh
+                    var clusters = 1;
+                    for (var i = 1; i < around.Length; i++)
+                        if ((around[i].Angle - around[i - 1].Angle).Abs() > 1e-6) clusters++;
+
+                    if (clusters <= 2)
+                    {
+                        var meshes = new HashSet<int>();
+                        for (var i = 0; i < around.Length; i++) meshes.Add(around[i].Mesh);
+                        foreach (var mesh in meshes.OrderBy(x => x))
+                        {
+                            var active = new List<int>();
+                            for (var i = 0; i < around.Length; i++)
+                                if (!paired[i] && around[i].Mesh == mesh) active.Add(i);
+                            PairCycle(active);
+                        }
+                        // leftovers (unbalanced meshes) fall through angularly
+                        var rest = new List<int>();
+                        for (var i = 0; i < around.Length; i++) if (!paired[i]) rest.Add(i);
+                        PairCycle(rest);
+                    }
+                    else
+                    {
+                        var all = new List<int>();
+                        for (var i = 0; i < around.Length; i++) all.Add(i);
+                        PairCycle(all);
                     }
                 }
             }
@@ -500,7 +546,19 @@ namespace Aardvark.Geometry
             {
                 var violation = ManifoldChecks.FindManifoldViolation(fia, via, positions.Length);
                 if (violation != null)
-                    throw new CsgVerificationException($"output verification failed: {violation}");
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(violation, @"(\d+)[->]+(\d+)");
+                    var context = "";
+                    if (match.Success)
+                    {
+                        var lu = int.Parse(match.Groups[1].Value);
+                        var lv = int.Parse(match.Groups[2].Value);
+                        if (lu < kernelOfLocal.Count && lv < kernelOfLocal.Count)
+                            context = $" [kernel {kernelOfLocal[lu]}@{positions[lu]} f{k.TolFactor[kernelOfLocal[lu]]:0.#} - " +
+                                      $"{kernelOfLocal[lv]}@{positions[lv]} f{k.TolFactor[kernelOfLocal[lv]]:0.#}]";
+                    }
+                    throw new CsgVerificationException($"output verification failed: {violation}{context}");
+                }
             }
             Lap("verify");
 
