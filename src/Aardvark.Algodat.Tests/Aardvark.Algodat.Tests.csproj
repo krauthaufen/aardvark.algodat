@@ -18,6 +18,9 @@
     <NoWarn>1701;1702;7022;0130</NoWarn>
   </PropertyGroup>
   <ItemGroup>
+    <Content Include="PolyMesh\manifold-cases.json.gz" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\Aardvark.Data.E57\Aardvark.Data.E57.csproj" />
     <ProjectReference Include="..\Aardvark.Data.Points.Ascii\Aardvark.Data.Points.Ascii.csproj" />
     <ProjectReference Include="..\Aardvark.Data.Points.Base\Aardvark.Data.Points.Base.csproj" />

@@ -51,6 +51,8 @@ namespace Aardvark.Geometry
         private readonly Dictionary<int, HashSet<(int, int)>> m_faceConstraints = new(); // kernel tri -> segments
         private readonly HashSet<(int, int)>[] m_barriers = { new(), new() }; // per mesh: constraint sub-edges
         private readonly Dictionary<int, List<(int Partner, bool Same)>> m_coplanar = new(); // tri -> overlapping coplanar tris of the other mesh
+        private readonly CsgBvh?[] m_bvh = new CsgBvh?[2];
+        private readonly int[][] m_triOf = new int[2][];
 
         public Pipeline(Kernel kernel)
         {
@@ -171,13 +173,12 @@ namespace Aardvark.Geometry
         private List<(int, int)> BroadPhase()
         {
             var boxes = new Box3d[2][];
-            var triOf = new int[2][];
             for (var m = 0; m < 2; m++)
             {
                 var list = new List<int>();
                 for (var t = 0; t < m_kernel.TriangleCount; t++)
                     if (m_kernel.TriMesh[t] == m) list.Add(t);
-                triOf[m] = list.ToArray();
+                m_triOf[m] = list.ToArray();
                 boxes[m] = new Box3d[list.Count];
                 for (var i = 0; i < list.Count; i++)
                 {
@@ -189,10 +190,11 @@ namespace Aardvark.Geometry
                     var slack = 8 * m_eps.Relative * box.Min.NormMax.Max(box.Max.NormMax);
                     boxes[m][i] = box.EnlargedBy(slack);
                 }
+                m_bvh[m] = new CsgBvh(boxes[m]);
             }
             var pairs = new List<(int, int)>();
-            new CsgBvh(boxes[0]).ForEachIntersectingPair(new CsgBvh(boxes[1]),
-                (i, j) => pairs.Add((triOf[0][i], triOf[1][j])));
+            m_bvh[0]!.ForEachIntersectingPair(m_bvh[1]!,
+                (i, j) => pairs.Add((m_triOf[0][i], m_triOf[1][j])));
             return pairs;
         }
 
@@ -447,6 +449,14 @@ namespace Aardvark.Geometry
                     foreach (var (ca, cb) in constraints) cdt.AddConstraint(ca, cb);
                 }
 
+                var debugFace = Environment.GetEnvironmentVariable("CSG_DEBUG_FACE") == tri.ToString();
+                if (debugFace)
+                {
+                    Console.WriteLine($"FACE {tri}: corners {m_kernel.T0[tri]},{m_kernel.T1[tri]},{m_kernel.T2[tri]}");
+                    if (boundary != null) Console.WriteLine($"  boundary: {string.Join(",", boundary)}");
+                    if (constraints != null)
+                        foreach (var (ca, cb) in constraints) Console.WriteLine($"  constraint ({ca},{cb})");
+                }
                 List<(int, int, int)> tris;
                 List<(int, int)> constraintEdges;
                 try
@@ -456,6 +466,11 @@ namespace Aardvark.Geometry
                 catch (CsgVerificationException e)
                 {
                     throw new CsgVerificationException(Diag(e));
+                }
+                if (debugFace)
+                {
+                    foreach (var (x, y, z) in tris) Console.WriteLine($"  tri ({x},{y},{z})");
+                    foreach (var (x, y) in constraintEdges) Console.WriteLine($"  constrained ({x},{y})");
                 }
                 foreach (var (a, b, c) in tris) Fragments.Add(new Fragment(a, b, c, tri));
                 var barrier = m_barriers[m_kernel.TriMesh[tri]];
@@ -612,13 +627,12 @@ namespace Aardvark.Geometry
             throw new CsgVerificationException("could not classify a surface region (all ray casts ambiguous)");
         }
 
-        /// <summary>Parity of ray/other-mesh crossings; null when any hit is eps-ambiguous.</summary>
+        /// <summary>Parity of ray/other-mesh crossings; null when any hit is eps-ambiguous. BVH-accelerated.</summary>
         private bool? RayParity(V3d o, V3d dir, int otherMesh)
         {
             var count = 0;
-            for (var t = 0; t < m_kernel.TriangleCount; t++)
+            foreach (var t in m_bvh[otherMesh]!.RayCandidates(o, dir, m_triOf[otherMesh]))
             {
-                if (m_kernel.TriMesh[t] != otherMesh) continue;
                 var plane = m_kernel.Planes[m_kernel.TriPlane[t]];
                 var denom = plane.Normal.Dot(dir);
                 var h = plane.Normal.Dot(o) - plane.Distance;

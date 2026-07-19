@@ -70,6 +70,66 @@ namespace Aardvark.Geometry.Tests
 
         [Test]
         [Explicit]
+        public void SliverDump()
+        {
+            var path = System.IO.Path.Combine(TestContext.CurrentContext.TestDirectory, "PolyMesh", "manifold-cases.json.gz");
+            using var stream = new System.IO.Compression.GZipStream(System.IO.File.OpenRead(path), System.IO.Compression.CompressionMode.Decompress);
+            var doc = System.Text.Json.JsonDocument.Parse(stream);
+            foreach (var c in doc.RootElement.GetProperty("cases").EnumerateArray())
+            {
+                if (c.GetProperty("name").GetString() != "cube-eps-sliver") continue;
+                PolyMesh Mesh(System.Text.Json.JsonElement e)
+                {
+                    var vs = e.GetProperty("vertices").EnumerateArray().Select(x => x.GetDouble()).ToArray();
+                    var ts = e.GetProperty("triangles").EnumerateArray().Select(x => x.GetInt32()).ToArray();
+                    var pos = new V3d[vs.Length / 3].SetByIndex(i => new V3d(vs[i * 3], vs[i * 3 + 1], vs[i * 3 + 2]));
+                    var fia = new int[ts.Length / 3 + 1].SetByIndex(i => i * 3);
+                    return new PolyMesh { PositionArray = pos, FirstIndexArray = fia, VertexIndexArray = ts };
+                }
+                Environment.SetEnvironmentVariable("CSG_DEBUG_FACE", "8");
+                var a = Mesh(c.GetProperty("a"));
+                var b = Mesh(c.GetProperty("b"));
+                var kernel = new Kernel(new Eps(1e-11));
+                kernel.Ingest(a, 0);
+                kernel.Ingest(b, 1);
+                var pipe = new Pipeline(kernel);
+                pipe.Run();
+                Console.WriteLine($"tris {kernel.TriangleCount} verts {kernel.Positions.Count} frags {pipe.Fragments.Count}");
+                for (var f = 0; f < pipe.Fragments.Count; f++)
+                {
+                    var fr = pipe.Fragments[f];
+                    var ce = (kernel.Positions[fr.V0] + kernel.Positions[fr.V1] + kernel.Positions[fr.V2]) / 3;
+                    Console.WriteLine($"frag {f}: mesh {kernel.TriMesh[fr.Parent]} parent {fr.Parent} verts ({fr.V0},{fr.V1},{fr.V2}) c ({ce.X:0.########},{ce.Y:0.###},{ce.Z:0.###}) {pipe.Labels[f]}");
+                }
+                for (var vi = 0; vi < kernel.Positions.Count; vi++)
+                    Console.WriteLine($"vert {vi}: ({kernel.Positions[vi].X:0.#########},{kernel.Positions[vi].Y:0.#########},{kernel.Positions[vi].Z:0.#########}) gen {kernel.Generation[vi]}");
+                // union selection: Outside everywhere + OnSame from mesh 0
+                var kept = new System.Collections.Generic.List<int>();
+                for (var f = 0; f < pipe.Fragments.Count; f++)
+                {
+                    var l = pipe.Labels[f];
+                    var mesh = kernel.TriMesh[pipe.Fragments[f].Parent];
+                    if (l == FragLabel.Outside || (l == FragLabel.OnSame && mesh == 0)) kept.Add(f);
+                }
+                var dirCount = new System.Collections.Generic.Dictionary<(int, int), System.Collections.Generic.List<int>>();
+                foreach (var f in kept)
+                {
+                    var fr = pipe.Fragments[f];
+                    foreach (var (u, v) in new[] { (fr.V0, fr.V1), (fr.V1, fr.V2), (fr.V2, fr.V0) })
+                    {
+                        if (!dirCount.TryGetValue((u, v), out var list)) dirCount[(u, v)] = list = new();
+                        list.Add(f);
+                    }
+                }
+                foreach (var kvp in dirCount.Where(kv => kv.Value.Count > 1))
+                    Console.WriteLine($"DUP directed edge {kvp.Key}: frags {string.Join(",", kvp.Value)}");
+                try { Csg.Union(a, b); Console.WriteLine("union ok"); }
+                catch (Exception e2) { Console.WriteLine($"union FAIL: {e2.Message}"); }
+            }
+        }
+
+        [Test]
+        [Explicit]
         public void Perf()
         {
             foreach (var sub in new[] { 4, 5, 6 })

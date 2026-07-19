@@ -81,46 +81,98 @@ namespace Aardvark.Geometry
                 var onCount = (s0 == Sign3.On ? 1 : 0) + (s1 == Sign3.On ? 1 : 0) + (s2 == Sign3.On ? 1 : 0);
                 if (onCount >= 2)
                 {
-                    // coincides with a corner: alias the kernel id to it
+                    // on two edge lines at once: either genuinely coincident
+                    // with their shared corner (alias), or a sliver corner —
+                    // then continue with the edge line the point is closer to
                     var corner = s0 == Sign3.On && s1 == Sign3.On ? b
                                : s1 == Sign3.On && s2 == Sign3.On ? c : a;
-                    m_localOfKernel[kernelId] = corner;
-                    return corner;
+                    if (m_eps.AreCoincident(p, m_pos[corner], 1))
+                    {
+                        m_localOfKernel[kernelId] = corner;
+                        return corner;
+                    }
+                    var d0 = s0 == Sign3.On ? LineDist2(m_pos[a], m_pos[b], p) : double.MaxValue;
+                    var d1 = s1 == Sign3.On ? LineDist2(m_pos[b], m_pos[c], p) : double.MaxValue;
+                    var d2 = s2 == Sign3.On ? LineDist2(m_pos[c], m_pos[a], p) : double.MaxValue;
+                    s0 = d0 <= d1 && d0 <= d2 ? Sign3.On : Sign3.Above;
+                    s1 = d1 < d0 && d1 <= d2 ? Sign3.On : Sign3.Above;
+                    s2 = d2 < d0 && d2 < d1 ? Sign3.On : Sign3.Above;
                 }
 
                 var li = AddPointRaw(kernelId, p);
-                if (onCount == 0)
+                if (s0 != Sign3.On && s1 != Sign3.On && s2 != Sign3.On)
                 {
                     // interior: 1 -> 3
                     m_dead[t] = true;
-                    AddTri(a, b, li); AddTri(b, c, li); AddTri(c, a, li);
-                    LegalizeAround(li);
+                    AddTriChecked(a, b, li); AddTriChecked(b, c, li); AddTriChecked(c, a, li);
                 }
                 else
                 {
                     // on one edge: split it in this triangle and in the neighbor (if any)
-                    var (u, v, w) = s0 == Sign3.On ? (a, b, c) : s1 == Sign3.On ? (b, c, a) : (c, a, b);
-                    m_dead[t] = true;
-                    AddTri(u, li, w); AddTri(li, v, w);
-                    var nt = FindTriWithEdge(v, u);
-                    if (nt >= 0)
-                    {
-                        var x = ThirdVertex(nt, v, u);
-                        m_dead[nt] = true;
-                        AddTri(v, li, x); AddTri(li, u, x);
-                    }
-                    if (m_constrained.Contains(Key(u, v)))
-                    {
-                        m_constrained.Remove(Key(u, v));
-                        m_constrained.Add(Key(u, li));
-                        m_constrained.Add(Key(li, v));
-                    }
-                    LegalizeAround(li);
+                    var (u, v) = s0 == Sign3.On ? (a, b) : s1 == Sign3.On ? (b, c) : (c, a);
+                    SplitEdgeAt(u, v, li);
                 }
+                LegalizeAround(li);
                 return li;
             }
             throw new CsgVerificationException("point to insert lies outside the face");
         }
+
+        private static double LineDist2(in V2d a, in V2d b, in V2d p)
+        {
+            var d = b - a;
+            var det = d.X * (p.Y - a.Y) - d.Y * (p.X - a.X);
+            return det * det / d.LengthSquared.Max(1e-300);
+        }
+
+        /// <summary>Splits edge (u,v) at point li in both incident triangles, maintaining the constrained-edge set.</summary>
+        private void SplitEdgeAt(int u, int v, int li)
+        {
+            var t = FindTriWithEdge(u, v);
+            if (t >= 0)
+            {
+                var w = ThirdVertex(t, u, v);
+                m_dead[t] = true;
+                AddTriChecked(u, li, w); AddTriChecked(li, v, w);
+            }
+            var nt = FindTriWithEdge(v, u);
+            if (nt >= 0)
+            {
+                var x = ThirdVertex(nt, v, u);
+                m_dead[nt] = true;
+                AddTriChecked(v, li, x); AddTriChecked(li, u, x);
+            }
+            if (m_constrained.Contains(Key(u, v)))
+            {
+                m_constrained.Remove(Key(u, v));
+                m_constrained.Add(Key(u, li));
+                m_constrained.Add(Key(li, v));
+            }
+        }
+
+        /// <summary>
+        /// Adds a triangle unless it is degenerate (collinear within eps): a
+        /// sliver split can produce a zero-area flap whose middle vertex lies
+        /// on another edge line; the flap is dropped and the split propagated
+        /// across its long edge instead, which restores a valid subdivision.
+        /// </summary>
+        private void AddTriChecked(int a, int b, int c)
+        {
+            if (Area(m_pos[a], m_pos[b], m_pos[c]) != Sign3.On)
+            {
+                AddTri(a, b, c);
+                return;
+            }
+            if (m_healGuard++ > 1000)
+                throw new CsgVerificationException("degenerate-triangle healing did not converge");
+            var ab = (m_pos[a] - m_pos[b]).LengthSquared;
+            var bc = (m_pos[b] - m_pos[c]).LengthSquared;
+            var ca = (m_pos[c] - m_pos[a]).LengthSquared;
+            var (p, q, mid) = ab >= bc && ab >= ca ? (a, b, c) : bc >= ca ? (b, c, a) : (c, a, b);
+            SplitEdgeAt(p, q, mid);
+        }
+
+        private int m_healGuard;
 
         private int FindTriWithEdge(int u, int v)
         {

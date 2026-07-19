@@ -56,6 +56,43 @@ namespace Aardvark.Geometry
                     (c.BFlags & Box.Flags.MaxZ1) != 0 ? c.BBox.Max.Z : parent.Max.Z));
 
         /// <summary>
+        /// Enumerates primitives whose (pre-enlarged) leaf boxes are hit by the
+        /// ray from o along dir (t >= 0), mapped through primToUser.
+        /// </summary>
+        public IEnumerable<int> RayCandidates(V3d o, V3d dir, int[] primToUser)
+        {
+            if (Count == 0) yield break;
+            var inv = new V3d(1.0 / dir.X, 1.0 / dir.Y, 1.0 / dir.Z);
+            var stack = new Stack<(int Ref, Box3d Box)>();
+            stack.Push((Count == 1 ? -1 : 0, RootBox));
+            while (stack.Count > 0)
+            {
+                var (r, box) = stack.Pop();
+                if (!RayHitsBox(o, inv, box)) continue;
+                if (r < 0)
+                {
+                    yield return primToUser[-1 - r];
+                }
+                else
+                {
+                    var c = Combined![r];
+                    stack.Push((Tree!.GetLeft(r), Child0(c, box)));
+                    stack.Push((Tree!.GetRight(r), Child1(c, box)));
+                }
+            }
+        }
+
+        private static bool RayHitsBox(in V3d o, in V3d inv, in Box3d b)
+        {
+            var t0x = (b.Min.X - o.X) * inv.X; var t1x = (b.Max.X - o.X) * inv.X;
+            var t0y = (b.Min.Y - o.Y) * inv.Y; var t1y = (b.Max.Y - o.Y) * inv.Y;
+            var t0z = (b.Min.Z - o.Z) * inv.Z; var t1z = (b.Max.Z - o.Z) * inv.Z;
+            var tMin = Fun.Max(t0x.Min(t1x), t0y.Min(t1y), t0z.Min(t1z)).Max(0.0);
+            var tMax = Fun.Min(t0x.Max(t1x), t0y.Max(t1y), t0z.Max(t1z));
+            return tMax >= tMin;
+        }
+
+        /// <summary>
         /// Reports every primitive pair (i in this, j in other) whose leaf
         /// boxes intersect. Leaf boxes should be pre-enlarged with the eps
         /// slack by the caller.

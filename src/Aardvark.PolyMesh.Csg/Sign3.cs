@@ -80,6 +80,13 @@ namespace Aardvark.Geometry
             return (a - b).NormMax <= tol;
         }
 
+        /// <summary>2D coincidence test (max-norm, relative, with scene term).</summary>
+        public bool AreCoincident(in V2d a, in V2d b, int generation = 0)
+        {
+            var tol = Relative * (a.NormMax + b.NormMax + Scene) * Gen(generation);
+            return (a - b).NormMax <= tol;
+        }
+
         /// <summary>
         /// Ternary orientation of 2D triangle (a,b,c): Above = counter-clockwise,
         /// Below = clockwise, On = degenerate within tolerance. The tolerance

@@ -71,18 +71,6 @@ namespace Aardvark.Geometry.Tests
             };
         }
 
-        /// <summary>True if the pair has coincident (coplanar) surface regions — area
-        /// comparisons against Manifold are skipped there (measure-zero contact
-        /// conventions differ legitimately).</summary>
-        private static bool HasCoplanarContact(PolyMesh a, PolyMesh b)
-        {
-            var kernel = new Kernel(new Eps(1e-11));
-            kernel.Ingest(a, 0);
-            kernel.Ingest(b, 1);
-            var pipeline = new Pipeline(kernel);
-            pipeline.Run();
-            return pipeline.Labels.Any(l => l == FragLabel.OnSame || l == FragLabel.OnOpposite);
-        }
 
         [Test]
         [Explicit]
@@ -95,15 +83,16 @@ namespace Aardvark.Geometry.Tests
                 object result;
                 try
                 {
-                    var union = Csg.Union(a, b);
-                    var inter = Csg.Intersection(a, b);
-                    var diff = Csg.Difference(a, b);
+                    var arrangement = CsgArrangement.Arrange(a, b);
+                    var union = arrangement.Union();
+                    var inter = arrangement.Intersection();
+                    var diff = arrangement.Difference();
                     result = new
                     {
                         name,
                         a = ExportMesh(a),
                         b = ExportMesh(b),
-                        coplanarContact = HasCoplanarContact(a, b),
+                        coplanarContact = arrangement.HasCoincidentContact,
                         unionVolume = union.Sum(Volume),
                         interVolume = inter.Sum(Volume),
                         diffVolume = diff.Sum(Volume),

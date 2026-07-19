@@ -40,6 +40,10 @@ namespace Aardvark.Geometry
             m_options = options;
         }
 
+        /// <summary>True if the two solids have coincident (coplanar) surface regions.</summary>
+        public bool HasCoincidentContact => m_pipeline.Labels.Any(
+            l => l == FragLabel.OnSame || l == FragLabel.OnOpposite);
+
         public static CsgArrangement Arrange(PolyMesh a, PolyMesh b, CsgOptions? options = null)
         {
             var o = options ?? CsgOptions.Default;
