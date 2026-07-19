@@ -149,7 +149,7 @@ namespace Aardvark.Geometry
         /// Appends an already verified/triangulated solid (no verification, no
         /// ear clipping, planes copied — ground truth preserved across chains).
         /// </summary>
-        public void IngestPrepared(CsgMesh solid, int meshIndex)
+        public void IngestPrepared(CsgMesh solid, int meshIndex, int maxThreads = 1)
         {
             if (meshIndex != MeshCount)
                 throw new ArgumentException($"meshes must be ingested in order (got index {meshIndex}, expected {MeshCount})");
@@ -172,17 +172,23 @@ namespace Aardvark.Geometry
                 TriPlane.Capacity = cap; TriMesh.Capacity = cap; TriFace.Capacity = cap;
                 C0.Capacity = cap; C1.Capacity = cap; C2.Capacity = cap;
             }
+            // vertices: bulk span copies instead of per-element list appends
+            var vOld = Positions.Count;
+            var vNew = vOld + pos.Length;
+            System.Runtime.InteropServices.CollectionsMarshal.SetCount(Positions, vNew);
+            System.Runtime.InteropServices.CollectionsMarshal.SetCount(Generation, vNew);
+            System.Runtime.InteropServices.CollectionsMarshal.SetCount(VertexMesh, vNew);
+            var posSpan = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(Positions).Slice(vOld);
+            System.Runtime.InteropServices.CollectionsMarshal.AsSpan(Generation).Slice(vOld).Clear();
+            System.Runtime.InteropServices.CollectionsMarshal.AsSpan(VertexMesh).Slice(vOld).Fill(meshIndex);
             if (solid.HasTrafo)
             {
-                // materialize the lazy transformation while copying
                 var bounds = Box3d.Invalid;
                 var maxMag = 0.0;
                 for (var i = 0; i < pos.Length; i++)
                 {
                     var p = solid.Trafo.Forward.TransformPos(pos[i]);
-                    Positions.Add(p);
-                    Generation.Add(0);
-                    VertexMesh.Add(meshIndex);
+                    posSpan[i] = p;
                     bounds.ExtendBy(p);
                     maxMag = maxMag.Max(p.NormMax);
                 }
@@ -191,12 +197,7 @@ namespace Aardvark.Geometry
             }
             else
             {
-                for (var i = 0; i < pos.Length; i++)
-                {
-                    Positions.Add(pos[i]);
-                    Generation.Add(0);
-                    VertexMesh.Add(meshIndex);
-                }
+                pos.AsSpan().CopyTo(posSpan);
                 Bounds.Add(solid.Bounds3d);
                 Eps = Eps.WithScene(Eps.Scene.Max(solid.MeshMag));
             }
@@ -204,12 +205,33 @@ namespace Aardvark.Geometry
             var planeOffset = Planes.Count;
             foreach (var p in solid.Planes)
                 Planes.Add(solid.HasTrafo ? solid.TransformPlane(p) : p);
-            for (var t = 0; t < solid.T0.Length; t++)
+
+            // triangles: bulk-resize, then a parallel offset-add fill
+            var triCount2 = solid.T0.Length;
+            var tOld = T0.Count;
+            var tNew = tOld + triCount2;
+            foreach (var list in new[] { T0, T1, T2, TriPlane, TriFace, C0, C1, C2 })
+                System.Runtime.InteropServices.CollectionsMarshal.SetCount(list, tNew);
+            System.Runtime.InteropServices.CollectionsMarshal.SetCount(TriMesh, tNew);
+            System.Runtime.InteropServices.CollectionsMarshal.AsSpan(TriMesh).Slice(tOld).Fill((byte)meshIndex);
+            var t0 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(T0);
+            var t1 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(T1);
+            var t2 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(T2);
+            var tp = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(TriPlane);
+            var tf = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(TriFace);
+            var c0 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(C0);
+            var c1 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(C1);
+            var c2 = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(C2);
+            solid.TriFace.AsSpan().CopyTo(tf.Slice(tOld));
+            solid.C0.AsSpan().CopyTo(c0.Slice(tOld));
+            solid.C1.AsSpan().CopyTo(c1.Slice(tOld));
+            solid.C2.AsSpan().CopyTo(c2.Slice(tOld));
+            for (var t = 0; t < triCount2; t++)
             {
-                AddTriangle(
-                    vertexOffset + solid.T0[t], vertexOffset + solid.T1[t], vertexOffset + solid.T2[t],
-                    planeOffset + solid.TriPlane[t], meshIndex, solid.TriFace[t],
-                    solid.C0[t], solid.C1[t], solid.C2[t]);
+                t0[tOld + t] = vertexOffset + solid.T0[t];
+                t1[tOld + t] = vertexOffset + solid.T1[t];
+                t2[tOld + t] = vertexOffset + solid.T2[t];
+                tp[tOld + t] = planeOffset + solid.TriPlane[t];
             }
         }
 
