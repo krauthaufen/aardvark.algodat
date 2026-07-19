@@ -143,7 +143,7 @@ namespace Aardvark.Geometry
                 if (zeros == 1)
                 {
                     var (u, v) = z0 ? (a, b) : z1 ? (b, c) : (c, a);
-                    if (FindTriWithEdge(v, u) >= 0 || Environment.GetEnvironmentVariable("CSG_OLD_INSERT") != null)
+                    if (FindTriWithEdge(v, u) >= 0)
                     {
                         SplitEdgeRaw(u, v, li);
                     }
@@ -477,7 +477,7 @@ namespace Aardvark.Geometry
         public (List<(int, int, int)> Triangles, List<(int, int)> ConstraintEdges) Triangulate()
         {
             foreach (var (a, b) in m_constraints) EnforceConstraint(a, b);
-            if (Environment.GetEnvironmentVariable("CSG_NO_CHAINFLIP") == null) RemoveChainSlivers();
+            RemoveChainSlivers();
 
             if (Environment.GetEnvironmentVariable("CSG_DEBUG_SLIVER") != null)
             {

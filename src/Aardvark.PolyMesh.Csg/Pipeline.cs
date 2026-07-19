@@ -475,8 +475,7 @@ namespace Aardvark.Geometry
             // MaxFactor coincidence radius still interact — with a smaller
             // slack, axis-planar twins (zero box extent) are never paired,
             // so coplanar sheets go unregistered and selection cracks
-            var slackScene = (Environment.GetEnvironmentVariable("CSG_OLD_SLACK") != null ? 8.0 : 4 * Eps.MaxFactor)
-                * m_eps.Relative * (m_eps.Scene + 1e-300);
+            var slackScene = 4 * Eps.MaxFactor * m_eps.Relative * (m_eps.Scene + 1e-300);
             for (var m = 0; m < n; m++)
             {
                 var list = new List<int>();
@@ -1763,22 +1762,18 @@ namespace Aardvark.Geometry
                 var partners = m_coplanar.GetOrDefault(frag.Parent);
                 if (partners == null) continue;
                 var centroid = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
-                var ff = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
-                    ? Eps.GenerationFactor
-                    : Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
-                        .Max(Eps.GenerationFactor);
+                var ff = Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
+                    .Max(Eps.GenerationFactor);
                 foreach (var (partner, same, slab) in partners)
                 {
                     var pm = m_kernel.TriMesh[partner];
                     if (m_rel[f * n + pm] != 0) continue;
                     // coverage at the pair's working factor: grazing sheets
                     // scatter sliver centroids beyond the baseline band
-                    var pf = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
-                        ? Eps.GenerationFactor
-                        : Fun.Max(slab, ff)
-                            .Max(m_kernel.TolFactor[m_kernel.T0[partner]])
-                            .Max(m_kernel.TolFactor[m_kernel.T1[partner]])
-                            .Max(m_kernel.TolFactor[m_kernel.T2[partner]]);
+                    var pf = Fun.Max(slab, ff)
+                        .Max(m_kernel.TolFactor[m_kernel.T0[partner]])
+                        .Max(m_kernel.TolFactor[m_kernel.T1[partner]])
+                        .Max(m_kernel.TolFactor[m_kernel.T2[partner]]);
                     var covers = CoplanarCovers(partner, centroid, pf);
                     if (s_debugFrag == f.ToString())
                         Console.WriteLine($"FRAG {f}: partner {partner} mesh {pm} same {same} pf {pf:0.#} covers {covers}");
@@ -1938,10 +1933,8 @@ namespace Aardvark.Geometry
             {
                 var frag = Fragments[f];
                 var o = (m_kernel.Positions[frag.V0] + m_kernel.Positions[frag.V1] + m_kernel.Positions[frag.V2]) / 3.0;
-                var of = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
-                    ? Eps.GenerationFactor
-                    : Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
-                        .Max(Eps.GenerationFactor);
+                var of = Fun.Max(m_kernel.TolFactor[frag.V0], m_kernel.TolFactor[frag.V1], m_kernel.TolFactor[frag.V2])
+                    .Max(Eps.GenerationFactor);
                 foreach (var dir in s_rayDirs)
                 {
                     var parity = RayParity(o, dir, otherMesh, of);
@@ -1960,10 +1953,8 @@ namespace Aardvark.Geometry
                 var plane = m_kernel.Planes[m_kernel.TriPlane[t]];
                 // a hit near the origin on grazing geometry poisons parity at
                 // the WIDENED tolerances, not just the baseline band
-                var tf = Environment.GetEnvironmentVariable("CSG_OLD_CLASSIFY") != null
-                    ? Eps.GenerationFactor
-                    : originFactor.Max(m_kernel.TolFactor[m_kernel.T0[t]])
-                        .Max(m_kernel.TolFactor[m_kernel.T1[t]]).Max(m_kernel.TolFactor[m_kernel.T2[t]]);
+                var tf = originFactor.Max(m_kernel.TolFactor[m_kernel.T0[t]])
+                    .Max(m_kernel.TolFactor[m_kernel.T1[t]]).Max(m_kernel.TolFactor[m_kernel.T2[t]]);
                 var denom = plane.Normal.Dot(dir);
                 var h = plane.Normal.Dot(o) - plane.Distance;
                 if (denom.Abs() < 1e-9)
