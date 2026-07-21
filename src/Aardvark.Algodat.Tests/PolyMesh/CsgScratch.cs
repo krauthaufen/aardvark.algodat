@@ -351,6 +351,99 @@ namespace Aardvark.Geometry.Tests
             }
         }
 
+        // n-gon prism (capped cylinder) along Z
+        private static PolyMesh Cylinder(V3d center, double radius, double halfHeight, int segments, V3d axis)
+        {
+            var a = axis.Normalized;
+            var u = (a.Z.Abs() < 0.9 ? V3d.ZAxis : V3d.XAxis).Cross(a).Normalized;
+            var v = a.Cross(u);
+            var pos = new System.Collections.Generic.List<V3d>();
+            for (var i = 0; i < segments; i++)
+            {
+                var ang = 2 * Constant.Pi * i / segments;
+                var r = (Fun.Cos(ang) * u + Fun.Sin(ang) * v) * radius;
+                pos.Add(center + r + a * halfHeight);   // top ring  i
+                pos.Add(center + r - a * halfHeight);   // bottom ring i
+            }
+            var fia = new System.Collections.Generic.List<int> { 0 };
+            var via = new System.Collections.Generic.List<int>();
+            for (var i = 0; i < segments; i++) // side quads
+            {
+                var j = (i + 1) % segments;
+                via.AddRange(new[] { i * 2, j * 2, j * 2 + 1, i * 2 + 1 }); fia.Add(via.Count);
+            }
+            var top = new System.Collections.Generic.List<int>();
+            var bot = new System.Collections.Generic.List<int>();
+            for (var i = 0; i < segments; i++) { top.Add(i * 2); bot.Add((segments - 1 - i) * 2 + 1); }
+            via.AddRange(top); fia.Add(via.Count);
+            via.AddRange(bot); fia.Add(via.Count);
+            return new PolyMesh { PositionArray = pos.ToArray(), FirstIndexArray = fia.ToArray(), VertexIndexArray = via.ToArray() };
+        }
+
+        private static void WriteObj(string path, PolyMesh[] meshes)
+        {
+            using var w = new System.IO.StreamWriter(path);
+            var off = 0;
+            foreach (var m in meshes)
+            {
+                foreach (var p in m.PositionArray)
+                    w.WriteLine($"v {p.X.ToString(System.Globalization.CultureInfo.InvariantCulture)} {p.Y.ToString(System.Globalization.CultureInfo.InvariantCulture)} {p.Z.ToString(System.Globalization.CultureInfo.InvariantCulture)}");
+                var fia = m.FirstIndexArray; var via = m.VertexIndexArray;
+                for (var fi = 0; fi + 1 < fia.Length; fi++)
+                {
+                    w.Write("f");
+                    for (var i = fia[fi]; i < fia[fi + 1]; i++) w.Write($" {via[i] + off + 1}");
+                    w.WriteLine();
+                }
+                off += m.PositionArray.Length;
+            }
+        }
+
+        [Test]
+        [Explicit]
+        public void ExportGallery()
+        {
+            var dir = Environment.GetEnvironmentVariable("CSG_OUT") ?? ".";
+            System.IO.Directory.CreateDirectory(dir);
+            void Save(string name, Func<PolyMesh[]> make)
+            {
+                try { var r = make(); WriteObj(System.IO.Path.Combine(dir, name + ".obj"), r); Console.WriteLine($"{name}: {r.Length} part(s), {r.Sum(m => m.FirstIndexArray.Length - 1)} faces"); }
+                catch (Exception ex) { Console.WriteLine($"{name}: FAIL {ex.Message.Split(';')[0]}"); }
+            }
+            // hand-built cylinders may have loose winding — repair to a clean manifold first
+            PolyMesh Cyl(V3d c, double r, double h, int seg, V3d ax) => PolyMeshRepair.Repair(Cylinder(c, r, h, seg, ax))[0];
+
+            var box = CsgM0Tests.QuadBox(new Box3d(new V3d(-0.75), new V3d(0.75)));
+            var ball = CsgM5Tests.Icosphere(V3d.Zero, 1.0, 4);
+            var ballBig = CsgM5Tests.Icosphere(V3d.Zero, 1.0, 4);
+
+            // 1. union of two overlapping spheres (peanut)
+            Save("01_union_spheres", () => Csg.Union(CsgM5Tests.Icosphere(new V3d(-0.5, 0, 0), 1.0, 4), CsgM5Tests.Icosphere(new V3d(0.5, 0, 0), 1.0, 4)));
+            // 2. rounded cube: box ∩ sphere
+            Save("02_intersect_box_sphere", () => Csg.Intersection(box, ballBig));
+            // 3. sphere with a box bite taken out
+            Save("03_sphere_minus_box", () => Csg.Difference(ball, CsgM0Tests.QuadBox(new Box3d(new V3d(0, -1.1, -1.1), new V3d(1.1, 1.1, 1.1)))));
+            // 4. box drilled by three orthogonal cylinders
+            var drill = new[] { Cyl(V3d.Zero, 0.45, 1.5, 40, V3d.XAxis), Cyl(V3d.Zero, 0.45, 1.5, 40, V3d.YAxis), Cyl(V3d.Zero, 0.45, 1.5, 40, V3d.ZAxis) };
+            Save("04_box_drilled", () => Csg.Difference(CsgM0Tests.QuadBox(new Box3d(new V3d(-1), new V3d(1))), drill));
+            // 5. n-ary union: a cluster of spheres (molecule)
+            var rnd = new RandomSystem(7);
+            var atoms = Enumerable.Range(0, 7).Select(_ => CsgM5Tests.Icosphere(rnd.UniformV3d() * 1.6 - new V3d(0.8), 0.6 + rnd.UniformDouble() * 0.2, 3)).ToArray();
+            Save("05_union_cluster", () => Csg.Union(atoms));
+            // 6. self-intersection resolution: two interpenetrating boxes as ONE mesh → clean union
+            var a = CsgM0Tests.QuadBox(new Box3d(new V3d(-0.9), new V3d(0.3)));
+            var b = CsgM0Tests.QuadBox(new Box3d(new V3d(-0.3), new V3d(0.9)));
+            var soup = new PolyMesh
+            {
+                PositionArray = a.PositionArray.Concat(b.PositionArray).ToArray(),
+                FirstIndexArray = Enumerable.Range(0, (a.FirstIndexArray.Length - 1 + b.FirstIndexArray.Length - 1) + 1).Select(i => i * 4).ToArray(),
+                VertexIndexArray = a.VertexIndexArray.Concat(b.VertexIndexArray.Select(v => v + a.PositionArray.Length)).ToArray(),
+            };
+            Save("06_selfresolve_boxes", () => Csg.ResolveSelfIntersections(soup));
+            // 7. difference of two spheres (crescent shell)
+            Save("07_sphere_minus_sphere", () => Csg.Difference(CsgM5Tests.Icosphere(V3d.Zero, 1.0, 4), CsgM5Tests.Icosphere(new V3d(0.6, 0.3, 0.3), 0.9, 4)));
+        }
+
         [Test]
         [Explicit]
         public void SelfDump()

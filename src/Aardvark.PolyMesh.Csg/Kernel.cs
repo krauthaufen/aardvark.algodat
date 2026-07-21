@@ -20,6 +20,48 @@ namespace Aardvark.Geometry
         /// <summary>per-vertex tolerance factor: 1 for input vertices, conditioning-derived for cuts</summary>
         public readonly List<double> TolFactor = new();
 
+        // --- exact geometry (parallel to Positions) --------------------------
+        // Every vertex additionally carries an exact BigInteger position: input
+        // vertices are the exact scaled integer of their double coordinates; cut
+        // vertices are the exact intersection of the segment and plane that made
+        // them. Predicates evaluated on these are mutually consistent, which is
+        // what removes float-inconsistency non-manifolds. Populated after
+        // UpdateSceneScale via BuildExactInputs, then kept in lock-step at every
+        // vertex-append site.
+        public readonly List<ExactPoint> Exact = new();
+        /// <summary>Scene power-of-two scale: multiplying any input coord by 2^Shift yields an exact integer.</summary>
+        public int Shift;
+        private readonly List<ExactPlane?> m_exactPlanes = new();
+
+        /// <summary>Exact form of canonical plane <paramref name="id"/> (cached, built on demand).</summary>
+        public ExactPlane ExactPlaneOf(int id)
+        {
+            while (m_exactPlanes.Count <= id) m_exactPlanes.Add(null);
+            var p = m_exactPlanes[id];
+            if (p == null) { p = ExactPredicates.PlaneFrom(Planes[id], Shift); m_exactPlanes[id] = p; }
+            return p.Value;
+        }
+
+        /// <summary>
+        /// Compute the scene scale and the exact positions of all input vertices.
+        /// Call once after all meshes are ingested and UpdateSceneScale has run,
+        /// before any cut vertices are constructed.
+        /// </summary>
+        public void BuildExactInputs()
+        {
+            int shift = 0;
+            for (var i = 0; i < Positions.Count; i++)
+            {
+                var p = Positions[i];
+                shift = Math.Max(shift, ExactPredicates.ShiftFor(stackalloc[] { p.X, p.Y, p.Z }));
+            }
+            Shift = shift;
+            Exact.Clear();
+            Exact.Capacity = Positions.Count;
+            for (var i = 0; i < Positions.Count; i++)
+                Exact.Add(ExactPredicates.ToPoint(Positions[i], shift));
+        }
+
         // triangles (SoA, parallel lists)
         public readonly List<int> T0 = new(), T1 = new(), T2 = new();
         public readonly List<int> TriPlane = new();
@@ -47,6 +89,24 @@ namespace Aardvark.Geometry
             var maxMag = 0.0;
             for (var i = 0; i < Positions.Count; i++) maxMag = maxMag.Max(Positions[i].NormMax);
             Eps = Eps.WithScene(maxMag);
+        }
+
+        /// <summary>
+        /// Debug check (CSG_EXACT_CHECK): the exact list stays in lock-step with
+        /// Positions and each exact position agrees with the double position to
+        /// within rounding. Returns the max |exact - double| deviation seen.
+        /// </summary>
+        public double VerifyExact()
+        {
+            if (Exact.Count != Positions.Count)
+                throw new InvalidOperationException($"exact desync: Exact={Exact.Count} Positions={Positions.Count}");
+            var maxDev = 0.0;
+            for (var i = 0; i < Positions.Count; i++)
+            {
+                var d = (ExactPredicates.ToV3d(Exact[i], Shift) - Positions[i]).NormMax;
+                if (d > maxDev) maxDev = d;
+            }
+            return maxDev;
         }
 
         public int TriangleCount => T0.Count;

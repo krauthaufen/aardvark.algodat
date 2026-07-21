@@ -88,6 +88,7 @@ namespace Aardvark.Geometry
             m_maxThreads = maxThreads.Max(1);
             m_selfResolve = selfResolve;
             kernel.UpdateSceneScale();
+            kernel.BuildExactInputs();
             m_kernel = kernel;
             m_eps = kernel.Eps;
             m_prepared = prepared ?? new CsgMesh?[kernel.MeshCount];
@@ -149,6 +150,8 @@ namespace Aardvark.Geometry
             Lap($"subdivide ({Fragments.Count} fragments)");
             if (m_selfResolve) SelfClassify(); else Classify();
             Lap("classify");
+            if (Environment.GetEnvironmentVariable("CSG_EXACT_CHECK") != null)
+                Console.WriteLine($"EXACT_CHECK vertices={m_kernel.Positions.Count} maxDev={m_kernel.VerifyExact():E3} scene={m_eps.Scene:E3}");
         }
 
         #region welding
@@ -395,6 +398,34 @@ namespace Aardvark.Geometry
                     ? canon
                     : new Plane3d(-canon.Normal, -canon.Distance);
             }
+        }
+
+        /// <summary>
+        /// Exact position of vid relative to tri's 2D projection:
+        /// +1 strictly inside, 0 on the boundary, -1 outside (or degenerate
+        /// projection). Dropping the dominant axis is exact, so this is a single
+        /// consistent answer that WithinFace and EnsureInsertable both use — no
+        /// per-call tolerance factor, so they can never disagree (this is what
+        /// fixes the x-cross non-manifold).
+        /// </summary>
+        private int ExactFaceSide(int tri, int vid)
+        {
+            var n = m_kernel.Planes[m_kernel.TriPlane[tri]].Normal;
+            int axis = n.X.Abs() >= n.Y.Abs()
+                ? (n.X.Abs() >= n.Z.Abs() ? 0 : 2)
+                : (n.Y.Abs() >= n.Z.Abs() ? 1 : 2);
+            var a = m_kernel.Exact[m_kernel.T0[tri]];
+            var b = m_kernel.Exact[m_kernel.T1[tri]];
+            var c = m_kernel.Exact[m_kernel.T2[tri]];
+            var q = m_kernel.Exact[vid];
+            int tw = ExactPredicates.Orient2D(a, b, c, axis);
+            if (tw == 0) return -1;                       // degenerate face projection
+            if (tw < 0) (b, c) = (c, b);                  // normalize to CCW
+            int s0 = ExactPredicates.Orient2D(a, b, q, axis);
+            int s1 = ExactPredicates.Orient2D(b, c, q, axis);
+            int s2 = ExactPredicates.Orient2D(c, a, q, axis);
+            if (s0 < 0 || s1 < 0 || s2 < 0) return -1;
+            return (s0 == 0 || s1 == 0 || s2 == 0) ? 0 : 1;
         }
 
         /// <summary>Point inside-or-on the triangle's 2D projection, at the point's tolerance factor.</summary>
@@ -836,6 +867,9 @@ namespace Aardvark.Geometry
                 vid = m_kernel.Positions.Count;
                 m_kernel.Positions.Add(p);
                 m_kernel.TolFactor.Add(factor);
+                // TODO(exact): coplanar outline clip point — represent as the exact
+                // 2-line intersection in the face plane; provisional exact-from-rounded.
+                m_kernel.Exact.Add(ExactPredicates.ToPoint(p, m_kernel.Shift));
                 GridAdd(vid);
             }
             RegisterEdgePoint(u, v, vid);
@@ -950,6 +984,12 @@ namespace Aardvark.Geometry
                     vid = m_kernel.Positions.Count;
                     m_kernel.Positions.Add(c.Pos);
                     m_kernel.TolFactor.Add(c.Factor);
+                    // exact position: the segment (EdgeA,EdgeB) meets the cutting plane
+                    m_kernel.Exact.Add(
+                        cutPlane >= 0 && cutPlane < m_kernel.Planes.Count
+                            ? ExactPredicates.IntersectSegmentPlane(
+                                m_kernel.Exact[c.EdgeA], m_kernel.Exact[c.EdgeB], m_kernel.ExactPlaneOf(cutPlane))
+                            : ExactPredicates.ToPoint(c.Pos, m_kernel.Shift));
                     GridAdd(vid);
                 }
                 RegisterEdgePoint(c.EdgeA, c.EdgeB, vid);
@@ -1309,6 +1349,9 @@ namespace Aardvark.Geometry
                                 vid = m_kernel.Positions.Count;
                                 m_kernel.Positions.Add(p);
                                 m_kernel.TolFactor.Add(factor);
+                                // TODO(exact): gen-2 constraint-crossing — represent as the
+                                // exact 2-line intersection in the face plane; provisional.
+                                m_kernel.Exact.Add(ExactPredicates.ToPoint(p, m_kernel.Shift));
                                 GridAdd(vid);
                             }
                             AddSplit(segs[i], vid);
